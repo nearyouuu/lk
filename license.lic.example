@@ -1,0 +1,25 @@
+{
+  "payload": {
+    "license_id": "LIC-2026-000001",
+    "customer": "Example Customer",
+    "product": "lk",
+    "tariff": "standard",
+    "issued_at": "2026-06-23T10:00:00Z",
+    "expires_at": "2027-06-23T10:00:00Z",
+    "features": [
+      "admin_roles",
+      "schedule",
+      "grades",
+      "attendance",
+      "portfolio",
+      "user_page",
+      "applications",
+      "materials",
+      "tests"
+    ],
+    "hardware_fingerprint": "sha256:replace-with-real-fingerprint",
+    "max_users": 500,
+    "allowed_domains": ["example.com"]
+  },
+  "signature": "BASE64_ED25519_SIGNATURE"
+}

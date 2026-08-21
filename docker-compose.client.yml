@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      LICENSE_FILE_PATH: /run/license/license.lic
+      LICENSE_PUBLIC_KEY_PATH: /run/license/license_public.pem
+      LICENSE_MACHINE_ID_PATH: /run/host/machine-id
+      MEDIA_ROOT: /opt/lk/media
+    volumes:
+      - ./license.lic:/run/license/license.lic:ro
+      - ./license_public.pem:/run/license/license_public.pem:ro
+      - /etc/machine-id:/run/host/machine-id:ro
+      - media:/opt/lk/media
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-6123}:6123"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  media:

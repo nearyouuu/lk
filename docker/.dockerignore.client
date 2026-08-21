@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+license.lic
+license_public.pem
+license_private.pem
+*.dump
+*.sql
+*.tar.gz
+media/

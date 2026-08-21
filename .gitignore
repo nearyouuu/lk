@@ -1,0 +1,17 @@
+.env
+.env.client
+license_private.pem
+license_public.pem
+license.lic
+license.local.lic
+dist/
+build/
+__pycache__/
+*.py[cod]
+*.log
+*.dump
+*.sql
+*.tar.gz
+media/
+app/media/
+exports/

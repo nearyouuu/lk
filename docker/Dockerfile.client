@@ -1,0 +1,15 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/lk
+COPY . /opt/lk
+RUN chmod +x /opt/lk/lk_backend /opt/lk/start.sh \
+    && mkdir -p /opt/lk/media \
+    && chown -R 10001:10001 /opt/lk
+
+USER 10001:10001
+EXPOSE 6123
+ENTRYPOINT ["/opt/lk/start.sh"]

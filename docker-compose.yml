@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16
+    container_name: cabinet-db
+    environment:
+      POSTGRES_DB: cabinet
+      POSTGRES_USER: cabinet
+      POSTGRES_PASSWORD: cabinet
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cabinet -d cabinet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: .
+    container_name: cabinet-backend
+    command: /entrypoint.sh
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cabinet:cabinet@db:5432/cabinet
+      DB_HOST: db
+      DB_PORT: 5432
+      LICENSE_MACHINE_ID: ${LICENSE_MACHINE_ID:?set LICENSE_MACHINE_ID in .env}
+      LICENSE_FILE_PATH: /run/local-license/license.lic
+      LICENSE_PUBLIC_KEY_PATH: /run/local-license/license_public.pem
+    volumes:
+      - .:/code
+      - type: bind
+        source: ./license.local.lic
+        target: /run/local-license/license.lic
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./license_public.pem
+        target: /run/local-license/license_public.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "6123:6123"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
