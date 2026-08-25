@@ -17,9 +17,10 @@ class JournalLessonCreate(BaseModel):
     subject_id: int
     teacher_id: int | None = None
     date: DateType
+    hours: int = Field(default=2, ge=1, le=24)
     starts_at: TimeType | None = None
     ends_at: TimeType | None = None
-    type: LessonType
+    type: LessonType = "practice"
     topic_id: int | None = None
     topic_text: str | None = Field(default=None, max_length=500)
     comment: str | None = None
@@ -34,9 +35,7 @@ class JournalLessonCreate(BaseModel):
         return value.strip() or None
 
     @model_validator(mode="after")
-    def validate_times_and_topic(self):
-        if not self.topic_id and not self.topic_text:
-            raise ValueError("topic_id or topic_text is required")
+    def validate_times(self):
         if self.starts_at and self.ends_at and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be later than starts_at")
         return self
@@ -45,6 +44,7 @@ class JournalLessonCreate(BaseModel):
 class JournalLessonPatch(BaseModel):
     version: int = Field(ge=1)
     date: DateType | None = None
+    hours: int | None = Field(default=None, ge=1, le=24)
     starts_at: TimeType | None = None
     ends_at: TimeType | None = None
     type: LessonType | None = None
@@ -133,14 +133,13 @@ class ControlPointsGenerate(BaseModel):
     academic_year: int = Field(ge=2000, le=2200)
     semester: Semester
     total_practical_hours: int = Field(gt=0, le=2000)
-    hours_per_lesson: int = Field(default=4, gt=0, le=24)
     study_component: StudyComponent = "discipline"
-    teacher_id: int | None = None
 
 
 class ControlPointPatch(BaseModel):
     version: int = Field(ge=1)
     planned_lesson_number: int | None = Field(default=None, gt=0)
+    planned_hours: int | None = Field(default=None, gt=0)
     planned_date: DateType | None = None
     journal_lesson_id: int | None = None
     status: Literal["draft", "published", "locked"] | None = None

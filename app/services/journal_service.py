@@ -14,7 +14,7 @@ from app.models.journal import (
     JournalPeriod,
 )
 from app.models.role import Permission, Role, role_permissions, user_roles
-from app.models.schedule import Lesson, Subject, Teacher
+from app.models.schedule import Subject, Teacher
 from app.models.user import User
 
 
@@ -149,30 +149,16 @@ def teacher_has_assignment(
     academic_year: int,
     semester: str,
 ) -> bool:
-    explicit = db.scalar(
-        select(JournalAssignment.id).where(
-            JournalAssignment.teacher_id == teacher_id,
-            JournalAssignment.group_id == group_id,
-            JournalAssignment.subject_id == subject_id,
-            JournalAssignment.academic_year == academic_year,
-            JournalAssignment.semester == semester,
-            JournalAssignment.is_active.is_(True),
-        )
-    )
-    if explicit:
-        return True
-
-    # Обратная совместимость: существующее расписание считается назначением.
-    starts_on, ends_on = period_bounds(academic_year, semester)
     return bool(
         db.scalar(
-            select(Lesson.id).where(
-                Lesson.teacher_id == teacher_id,
-                Lesson.group_id == group_id,
-                Lesson.subject_id == subject_id,
-                Lesson.starts_at >= datetime.combine(starts_on, datetime.min.time()),
-                Lesson.starts_at < datetime.combine(ends_on, datetime.max.time()),
-            ).limit(1)
+            select(JournalAssignment.id).where(
+                JournalAssignment.teacher_id == teacher_id,
+                JournalAssignment.group_id == group_id,
+                JournalAssignment.subject_id == subject_id,
+                JournalAssignment.academic_year == academic_year,
+                JournalAssignment.semester == semester,
+                JournalAssignment.is_active.is_(True),
+            )
         )
     )
 
@@ -196,21 +182,14 @@ def ensure_pair_access(
 
 
 def ensure_lesson_access(db: Session, user: User, lesson: JournalLesson) -> Teacher | None:
-    if is_privileged(db, user):
-        return None
-    teacher = get_teacher(db, user)
-    if teacher.id != lesson.teacher_id:
-        error(403, "JOURNAL_ACCESS_DENIED", "Можно изменять только свои занятия")
-    if not teacher_has_assignment(
+    return ensure_pair_access(
         db,
-        teacher.id,
+        user,
         lesson.group_id,
         lesson.subject_id,
         lesson.period.academic_year,
         lesson.period.semester,
-    ):
-        error(403, "JOURNAL_ACCESS_DENIED", "Назначение преподавателя недоступно")
-    return teacher
+    )
 
 
 def grade_scale(subject: Subject) -> str:
@@ -250,6 +229,7 @@ def lesson_state(lesson: JournalLesson | None) -> dict | None:
         return None
     return {
         "date": lesson.lesson_date.isoformat(),
+        "hours": lesson.hours,
         "starts_at": lesson.starts_at.isoformat() if lesson.starts_at else None,
         "ends_at": lesson.ends_at.isoformat() if lesson.ends_at else None,
         "type": lesson.lesson_type,

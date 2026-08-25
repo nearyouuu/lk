@@ -153,6 +153,7 @@ class JournalLesson(Base):
         ForeignKey("journal_periods.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     lesson_date: Mapped[date] = mapped_column(Date, nullable=False)
+    hours: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     starts_at: Mapped[time | None] = mapped_column(Time, nullable=True)
     ends_at: Mapped[time | None] = mapped_column(Time, nullable=True)
     lesson_type: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -303,14 +304,12 @@ class JournalControlPoint(Base):
     subject_id: Mapped[int] = mapped_column(
         ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False
     )
-    teacher_id: Mapped[int] = mapped_column(
-        ForeignKey("teachers.id", ondelete="RESTRICT"), nullable=False
-    )
     period_id: Mapped[int] = mapped_column(
         ForeignKey("journal_periods.id", ondelete="CASCADE"), nullable=False
     )
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     planned_lesson_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    planned_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
     planned_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     journal_lesson_id: Mapped[int | None] = mapped_column(
         ForeignKey("journal_lessons.id", ondelete="SET NULL"), nullable=True
@@ -342,7 +341,6 @@ class JournalControlPoint(Base):
 
     group = relationship("Group")
     subject = relationship("Subject")
-    teacher = relationship("Teacher")
     period = relationship("JournalPeriod")
     journal_lesson = relationship("JournalLesson")
     scores = relationship(

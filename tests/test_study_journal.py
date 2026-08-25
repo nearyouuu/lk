@@ -1,10 +1,12 @@
 import os
-from datetime import date, time
+from datetime import date, datetime, time
+from io import BytesIO
 
 os.environ["DATABASE_URL"] = "sqlite://"
 
 import pytest
-from sqlalchemy import create_engine
+from openpyxl import load_workbook
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -28,7 +30,7 @@ from app.models import (  # noqa: F401
 from app.models.grade import Student
 from app.models.journal import JournalEntry, JournalPeriod
 from app.models.role import Permission, Role, role_permissions, user_roles
-from app.models.schedule import Group, Subject, Teacher
+from app.models.schedule import Group, Lesson, Subject, Teacher
 from app.models.user import User
 from app.routers.admin_journal import (
     create_journal_assignment,
@@ -37,6 +39,7 @@ from app.routers.admin_journal import (
 )
 from app.routers.journal import (
     create_journal_lesson,
+    export_journal_excel,
     get_journal,
     put_journal_entries_batch,
     put_journal_entry,
@@ -296,6 +299,7 @@ def test_control_points_formula_attendance_and_project_limit():
                     date=date(2026, 8, 1 + index),
                     starts_at=time(9, 0),
                     ends_at=time(13, 0),
+                    hours=4,
                     type="practice",
                     topic_text=f"Topic {index + 1}",
                 ),
@@ -313,16 +317,17 @@ def test_control_points_formula_attendance_and_project_limit():
                 academic_year=2026,
                 semester="autumn",
                 total_practical_hours=68,
-                hours_per_lesson=4,
             ),
             None,
             db,
             teacher_user,
         )
         assert generated["lesson_count"] == 17
-        assert generated["interval"] == 6
+        assert generated["interval"] == 23
         assert [row["planned_lesson_number"] for row in generated["items"]] == [6, 12, 17]
+        assert [row["planned_hours"] for row in generated["items"]] == [23, 46, 68]
         assert [row["base_max"] for row in generated["items"]] == [23.0, 23.0, 24.0]
+        assert all("teacher_id" not in row for row in generated["items"])
 
         for index, lesson_id in enumerate(lesson_ids[:6]):
             put_journal_entry(
@@ -351,8 +356,8 @@ def test_control_points_formula_attendance_and_project_limit():
             db,
             teacher_user,
         )
-        assert first_score["eligible_lessons"] == 6
-        assert first_score["attended_lessons"] == 5
+        assert first_score["eligible_hours"] == 24
+        assert first_score["attended_hours"] == 20
         assert first_score["attendance_score"] == 2.5
         assert first_score["total_score"] == 35.5
 
@@ -419,7 +424,6 @@ def test_control_points_are_rejected_for_industrial_practice():
                     academic_year=2026,
                     semester="autumn",
                     total_practical_hours=68,
-                    hours_per_lesson=4,
                     study_component="industrial_practice",
                 ),
                 None,
@@ -427,4 +431,201 @@ def test_control_points_are_rejected_for_industrial_practice():
                 teacher_user,
             )
         assert exc_info.value.detail["error"]["code"] == "JOURNAL_CONTROL_POINTS_NOT_APPLICABLE"
+    engine.dispose()
+
+
+def test_assigned_teachers_share_the_same_journal_lessons():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        admin, first_user, first_teacher, group, subject, students = _fixture(db)
+        teacher_role = db.scalar(select(Role).where(Role.name == "teacher"))
+        second_user = User(
+            email="journal-second-teacher@test.kz",
+            password_hash="hash",
+            full_name="Second Teacher",
+        )
+        db.add(second_user)
+        db.flush()
+        db.execute(
+            user_roles.insert().values(user_id=second_user.id, role_id=teacher_role.id)
+        )
+        second_teacher = Teacher(user_id=second_user.id, full_name="Second Teacher")
+        db.add(second_teacher)
+        db.commit()
+
+        for teacher in (first_teacher, second_teacher):
+            create_journal_assignment(
+                JournalAssignmentCreate(
+                    teacher_id=teacher.id,
+                    group_id=group.id,
+                    subject_id=subject.id,
+                    academic_year=2026,
+                    semester="autumn",
+                ),
+                db,
+                admin,
+            )
+
+        lesson = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 9, 10),
+                type="practice",
+                topic_text="Shared lesson",
+            ),
+            None,
+            None,
+            db,
+            first_user,
+        )
+
+        visible = get_journal(
+            group.id,
+            subject.id,
+            date(2026, 9, 1),
+            date(2026, 9, 30),
+            db,
+            second_user,
+        )
+        assert [row["id"] for row in visible["lessons"]] == [lesson["id"]]
+
+        saved = put_journal_entry(
+            lesson["id"],
+            students[0].id,
+            JournalEntryPut(attendance="present", grade="3", version=0),
+            None,
+            db,
+            second_user,
+        )
+        assert saved["grade"] == "3"
+
+        admin_update = put_journal_entry(
+            lesson["id"],
+            students[0].id,
+            JournalEntryPut(attendance="present", grade="4", version=saved["version"]),
+            None,
+            db,
+            admin,
+        )
+        assert admin_update["grade"] == "4"
+    engine.dispose()
+
+
+def test_schedule_does_not_grant_journal_access():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        _admin, teacher_user, teacher, group, subject, _students = _fixture(db)
+        db.add(
+            Lesson(
+                group_id=group.id,
+                subject_id=subject.id,
+                teacher_id=teacher.id,
+                lesson_number=1,
+                starts_at=datetime(2026, 9, 1, 9, 0),
+                ends_at=datetime(2026, 9, 1, 10, 30),
+                subject_type="practice",
+            )
+        )
+        db.commit()
+
+        with pytest.raises(JournalAPIError) as denied:
+            get_journal(
+                group.id,
+                subject.id,
+                date(2026, 9, 1),
+                date(2026, 9, 30),
+                db,
+                teacher_user,
+            )
+        assert denied.value.detail["error"]["code"] == "JOURNAL_ACCESS_DENIED"
+    engine.dispose()
+
+
+def test_journal_excel_export_contains_hours_attendance_and_grades():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        admin, teacher_user, teacher, group, subject, students = _fixture(db)
+        create_journal_assignment(
+            JournalAssignmentCreate(
+                teacher_id=teacher.id,
+                group_id=group.id,
+                subject_id=subject.id,
+                academic_year=2026,
+                semester="autumn",
+            ),
+            db,
+            admin,
+        )
+        first = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 9, 1),
+                hours=4,
+                topic_text="Практическая работа № 1",
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        second = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 9, 8),
+                hours=2,
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        put_journal_entry(
+            first["id"],
+            students[0].id,
+            JournalEntryPut(attendance="absent", grade="4", version=0),
+            None,
+            db,
+            teacher_user,
+        )
+        put_journal_entry(
+            second["id"],
+            students[0].id,
+            JournalEntryPut(attendance="late", grade="5", version=0),
+            None,
+            db,
+            teacher_user,
+        )
+
+        response = export_journal_excel(
+            group.id,
+            subject.id,
+            date(2026, 9, 1),
+            date(2026, 12, 31),
+            db,
+            teacher_user,
+        )
+
+        assert response.media_type.startswith(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        assert "filename*=UTF-8''" in response.headers["content-disposition"]
+        workbook = load_workbook(BytesIO(response.body), data_only=False)
+        assert workbook.sheetnames == ["Учебный журнал", "Даты и темы"]
+        sheet = workbook["Учебный журнал"]
+        assert sheet["D5"].value == "01.09.2026 · 4 ч."
+        assert sheet["D6"].value == "Посещ."
+        assert sheet["E6"].value == "Оценка"
+        assert sheet["D7"].value == "Н"
+        assert sheet["E7"].value == "4"
+        assert sheet["F7"].value == "О"
+        assert sheet["G7"].value == "5"
+        assert sheet["H7"].value == 4
+        assert sheet["I7"].value == 4.5
+        assert workbook["Даты и темы"]["D4"].value == "Практическая работа № 1"
     engine.dispose()

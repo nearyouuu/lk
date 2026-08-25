@@ -1,4 +1,6 @@
-from datetime import date, datetime, time
+from datetime import date
+import re
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, Query, Response
 from sqlalchemy import and_, func, or_, select
@@ -46,6 +48,7 @@ from app.services.journal_service import (
     teacher_has_assignment,
     validate_grade,
 )
+from app.services.journal_export import JOURNAL_EXPORT_MEDIA_TYPE, build_journal_workbook
 
 
 router = APIRouter(prefix="/api/v1/journal", tags=["journal"])
@@ -67,6 +70,7 @@ def _lesson_out(lesson: JournalLesson) -> dict:
         "subject_id": lesson.subject_id,
         "teacher_id": lesson.teacher_id,
         "date": lesson.lesson_date.isoformat(),
+        "hours": lesson.hours,
         "starts_at": lesson.starts_at.isoformat() if lesson.starts_at else None,
         "ends_at": lesson.ends_at.isoformat() if lesson.ends_at else None,
         "type": lesson.lesson_type,
@@ -76,6 +80,7 @@ def _lesson_out(lesson: JournalLesson) -> dict:
         "topic_text": lesson.topic_text,
         "comment": lesson.comment,
         "schedule_lesson_id": lesson.schedule_lesson_id,
+        "source": "schedule" if lesson.schedule_lesson_id else "manual",
         "status": lesson.status,
         "version": lesson.version,
     }
@@ -106,7 +111,7 @@ def journal_catalog(
     me: User = Depends(get_current_user),
 ):
     ensure_permission(db, me, "journal.read")
-    starts_on, ends_on = period_bounds(academic_year, semester)
+    period_bounds(academic_year, semester)
     privileged = is_privileged(db, me)
     if teacher_id is not None and not privileged:
         error(403, "JOURNAL_ACCESS_DENIED", "teacher_id доступен только администратору")
@@ -137,21 +142,6 @@ def journal_catalog(
     pairs: dict[tuple[int, int], tuple[Group, Subject]] = {
         (row.group_id, row.subject_id): (row.group, row.subject) for row in assignments
     }
-
-    schedule_query = (
-        select(Lesson)
-        .options(joinedload(Lesson.group), joinedload(Lesson.subject))
-        .where(
-            Lesson.subject_id.is_not(None),
-            Lesson.starts_at >= datetime.combine(starts_on, time.min),
-            Lesson.starts_at <= datetime.combine(ends_on, time.max),
-        )
-    )
-    if selected_teacher_id is not None:
-        schedule_query = schedule_query.where(Lesson.teacher_id == selected_teacher_id)
-    for lesson in db.scalars(schedule_query).unique().all():
-        if lesson.subject:
-            pairs[(lesson.group_id, lesson.subject_id)] = (lesson.group, lesson.subject)
 
     group_ids = {group_id for group_id, _ in pairs}
     student_counts = dict(
@@ -233,6 +223,81 @@ def journal_group_students(
     return {"group_id": group_id, "items": [_student_out(row) for row in students]}
 
 
+@router.get("/export", summary="Скачать учебный журнал в Excel")
+def export_journal_excel(
+    group_id: int,
+    subject_id: int,
+    date_from: date,
+    date_to: date,
+    db: Session = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    ensure_permission(db, me, "journal.read")
+    if date_to < date_from:
+        error(422, "JOURNAL_INVALID_DATE_RANGE", "date_to должен быть не раньше date_from")
+    group = db.get(Group, group_id)
+    subject = db.get(Subject, subject_id)
+    if not group or not subject:
+        error(404, "JOURNAL_NOT_FOUND", "Группа или дисциплина не найдена")
+
+    academic_year, semester = period_key_for_date(date_from)
+    ensure_pair_access(db, me, group_id, subject_id, academic_year, semester)
+
+    lessons = db.scalars(
+        select(JournalLesson)
+        .options(
+            joinedload(JournalLesson.topic),
+            selectinload(JournalLesson.entries),
+            selectinload(JournalLesson.student_snapshots),
+        )
+        .where(
+            JournalLesson.group_id == group_id,
+            JournalLesson.subject_id == subject_id,
+            JournalLesson.lesson_date >= date_from,
+            JournalLesson.lesson_date <= date_to,
+        )
+        .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
+    ).unique().all()
+
+    snapshot_ids = {
+        row.student_id for lesson in lessons for row in lesson.student_snapshots
+    }
+    current_ids = set(
+        db.scalars(select(Student.id).where(Student.group_id == group_id)).all()
+    )
+    student_ids = snapshot_ids | current_ids
+    students = db.scalars(
+        select(Student)
+        .options(joinedload(Student.user))
+        .where(Student.id.in_(student_ids) if student_ids else False)
+    ).unique().all()
+    entries = [entry for lesson in lessons for entry in lesson.entries]
+
+    content = build_journal_workbook(
+        group=group,
+        subject=subject,
+        date_from=date_from,
+        date_to=date_to,
+        students=students,
+        lessons=lessons,
+        entries=entries,
+    )
+    name_part = re.sub(r"[^\w.-]+", "_", group.code or str(group.id)).strip("_.")
+    filename = (
+        f"Учебный_журнал_{name_part}_{date_from.isoformat()}_{date_to.isoformat()}.xlsx"
+    )
+    encoded_filename = quote(filename)
+    return Response(
+        content=content,
+        media_type=JOURNAL_EXPORT_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="study_journal.xlsx"; filename*=UTF-8\'\'{encoded_filename}'
+            )
+        },
+    )
+
+
 @router.get("")
 def get_journal(
     group_id: int,
@@ -251,7 +316,7 @@ def get_journal(
         error(404, "JOURNAL_NOT_FOUND", "Группа или дисциплина не найдена")
 
     academic_year, semester = period_key_for_date(date_from)
-    teacher = ensure_pair_access(
+    ensure_pair_access(
         db, me, group_id, subject_id, academic_year, semester
     )
     period = db.scalar(
@@ -281,8 +346,6 @@ def get_journal(
         )
         .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
     )
-    if teacher:
-        query = query.where(JournalLesson.teacher_id == teacher.id)
     lessons = db.scalars(query).unique().all()
 
     snapshot_ids = {
@@ -357,33 +420,75 @@ def create_journal_lesson(
             error(403, "JOURNAL_ACCESS_DENIED", "Нельзя создать занятие от другого преподавателя")
         teacher = current_teacher
     else:
-        teacher = db.get(Teacher, payload.teacher_id) if payload.teacher_id else None
-        if not teacher:
-            teacher = db.scalar(
-                select(Teacher)
-                .join(JournalAssignment, JournalAssignment.teacher_id == Teacher.id)
-                .where(
-                    JournalAssignment.group_id == payload.group_id,
-                    JournalAssignment.subject_id == payload.subject_id,
-                    JournalAssignment.academic_year == period.academic_year,
-                    JournalAssignment.semester == period.semester,
-                    JournalAssignment.is_active.is_(True),
-                )
-                .limit(1)
+        assigned_teacher_ids = list(
+            dict.fromkeys(
+                db.scalars(
+                    select(JournalAssignment.teacher_id).where(
+                        JournalAssignment.group_id == payload.group_id,
+                        JournalAssignment.subject_id == payload.subject_id,
+                        JournalAssignment.academic_year == period.academic_year,
+                        JournalAssignment.semester == period.semester,
+                        JournalAssignment.is_active.is_(True),
+                    )
+                ).all()
             )
-        if not teacher and subject.primary_teacher_id:
-            teacher = db.get(Teacher, subject.primary_teacher_id)
-        if not teacher:
-            error(422, "JOURNAL_TEACHER_REQUIRED", "Для занятия не назначен преподаватель")
+        )
+        if payload.teacher_id is not None:
+            if payload.teacher_id not in assigned_teacher_ids:
+                error(
+                    422,
+                    "JOURNAL_TEACHER_NOT_ASSIGNED",
+                    "Преподаватель не назначен на журнал группы по этой дисциплине",
+                )
+            teacher = db.get(Teacher, payload.teacher_id)
+        elif len(assigned_teacher_ids) == 1:
+            teacher = db.get(Teacher, assigned_teacher_ids[0])
+        elif not assigned_teacher_ids:
+            error(
+                422,
+                "JOURNAL_ASSIGNMENT_REQUIRED",
+                "Сначала назначьте преподавателя на журнал группы по дисциплине",
+            )
+        else:
+            error(
+                422,
+                "JOURNAL_TEACHER_REQUIRED",
+                "У журнала несколько преподавателей; укажите, кто проводит занятие",
+                {"teacher_ids": assigned_teacher_ids},
+            )
+
+    if payload.schedule_lesson_id is not None:
+        schedule_lesson = db.get(Lesson, payload.schedule_lesson_id)
+        if not schedule_lesson:
+            error(404, "JOURNAL_SCHEDULE_LESSON_NOT_FOUND", "Занятие расписания не найдено")
+        if (
+            schedule_lesson.group_id != payload.group_id
+            or schedule_lesson.subject_id != payload.subject_id
+        ):
+            error(
+                422,
+                "JOURNAL_SCHEDULE_LESSON_MISMATCH",
+                "Занятие расписания относится к другой группе или дисциплине",
+            )
+        linked_lesson_id = db.scalar(
+            select(JournalLesson.id).where(
+                JournalLesson.schedule_lesson_id == payload.schedule_lesson_id
+            )
+        )
+        if linked_lesson_id:
+            error(
+                409,
+                "JOURNAL_SCHEDULE_LESSON_ALREADY_IMPORTED",
+                "Занятие расписания уже добавлено в журнал",
+                {"journal_lesson_id": linked_lesson_id},
+            )
 
     topic = None
     if payload.topic_id:
         topic = db.get(SubjectTopic, payload.topic_id)
         if not topic or topic.subject_id != subject.id or not topic.is_active:
             error(422, "JOURNAL_TOPIC_SUBJECT_MISMATCH", "Тема не принадлежит дисциплине")
-    topic_text = payload.topic_text or (topic.title if topic else None)
-    if not topic_text:
-        error(422, "JOURNAL_TOPIC_REQUIRED", "Тема занятия обязательна")
+    topic_text = payload.topic_text or (topic.title if topic else "")
 
     duplicate_query = select(JournalLesson.id).where(
         JournalLesson.group_id == payload.group_id,
@@ -402,6 +507,7 @@ def create_journal_lesson(
         teacher_id=teacher.id,
         period_id=period.id,
         lesson_date=payload.date,
+        hours=payload.hours,
         starts_at=payload.starts_at,
         ends_at=payload.ends_at,
         lesson_type=payload.type,
@@ -494,6 +600,7 @@ def patch_journal_lesson(
         lesson.period_id = target_period.id
         lesson.period = target_period
     for field, attr in (
+        ("hours", "hours"),
         ("starts_at", "starts_at"),
         ("ends_at", "ends_at"),
         ("type", "lesson_type"),
@@ -518,9 +625,7 @@ def patch_journal_lesson(
             if "topic_text" not in changes:
                 lesson.topic_text = topic.title
     if "topic_text" in changes:
-        if not payload.topic_text:
-            error(422, "JOURNAL_TOPIC_REQUIRED", "Тема занятия обязательна")
-        lesson.topic_text = payload.topic_text
+        lesson.topic_text = payload.topic_text or ""
 
     lesson.version += 1
     lesson.updated_by = me.id

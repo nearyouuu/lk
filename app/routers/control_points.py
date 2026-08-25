@@ -10,7 +10,6 @@ from sqlalchemy.orm.exc import StaleDataError
 from app.core.deps import get_current_user, get_db
 from app.models.grade import Student
 from app.models.journal import (
-    JournalAssignment,
     JournalControlPoint,
     JournalControlPointScore,
     JournalEntry,
@@ -18,7 +17,7 @@ from app.models.journal import (
     JournalLessonStudent,
     JournalPeriod,
 )
-from app.models.schedule import Group, Subject, Teacher
+from app.models.schedule import Group, Subject
 from app.models.user import User
 from app.schemas.journal import (
     ControlPointBatchPut,
@@ -34,7 +33,6 @@ from app.services.journal_service import (
     ensure_unlocked,
     error,
     get_or_create_period,
-    is_privileged,
     student_full_name,
 )
 
@@ -63,6 +61,8 @@ def _score_out(score: JournalControlPointScore) -> dict:
         "attendance_is_manual": score.attendance_is_manual,
         "eligible_lessons": score.eligible_lessons,
         "attended_lessons": score.attended_lessons,
+        "eligible_hours": score.eligible_lessons,
+        "attended_hours": score.attended_lessons,
         "project_score": float(score.project_score),
         "total_score": float(total),
         "comment": score.comment,
@@ -75,10 +75,10 @@ def _control_point_out(point: JournalControlPoint, include_scores: bool = False)
         "id": point.id,
         "group_id": point.group_id,
         "subject_id": point.subject_id,
-        "teacher_id": point.teacher_id,
         "period_id": point.period_id,
         "number": point.number,
         "planned_lesson_number": point.planned_lesson_number,
+        "planned_hours": point.planned_hours,
         "planned_date": point.planned_date.isoformat() if point.planned_date else None,
         "journal_lesson_id": point.journal_lesson_id,
         "total_practical_hours": point.total_practical_hours,
@@ -99,6 +99,7 @@ def _point_state(point: JournalControlPoint) -> dict:
     return {
         "number": point.number,
         "planned_lesson_number": point.planned_lesson_number,
+        "planned_hours": point.planned_hours,
         "planned_date": point.planned_date.isoformat() if point.planned_date else None,
         "journal_lesson_id": point.journal_lesson_id,
         "status": point.status,
@@ -158,7 +159,6 @@ def _period_lessons(db: Session, point: JournalControlPoint) -> list[JournalLess
             JournalLesson.subject_id == point.subject_id,
             JournalLesson.lesson_date >= point.period.starts_on,
             JournalLesson.lesson_date <= point.period.ends_on,
-            JournalLesson.lesson_type.in_(("practice", "lab")),
             JournalLesson.status != "cancelled",
         )
         .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
@@ -193,17 +193,18 @@ def _calculate_attendance(
 ) -> tuple[int, int, Decimal]:
     lessons = _segment_lessons(db, point, all_points)
     lesson_ids = [row.id for row in lessons]
-    eligible = len(lesson_ids)
+    eligible = sum(row.hours for row in lessons)
     if eligible == 0:
         return 0, 0, Decimal("0.00")
-    absent_count = db.scalar(
-        select(func.count(JournalEntry.id)).where(
+    absent_lesson_ids = set(db.scalars(
+        select(JournalEntry.lesson_id).where(
             JournalEntry.lesson_id.in_(lesson_ids),
             JournalEntry.student_id == student_id,
             JournalEntry.attendance == "absent",
         )
-    ) or 0
-    attended = max(0, eligible - absent_count)
+    ).all())
+    absent_hours = sum(row.hours for row in lessons if row.id in absent_lesson_ids)
+    attended = max(0, eligible - absent_hours)
     calculated = (
         point.attendance_max * Decimal(attended) / Decimal(eligible)
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -272,7 +273,7 @@ def generate_control_points(
         error(404, "JOURNAL_NOT_FOUND", "Группа или дисциплина не найдена")
     period = get_or_create_period(db, payload.academic_year, payload.semester)
     ensure_unlocked(period)
-    current_teacher = ensure_pair_access(
+    ensure_pair_access(
         db,
         me,
         payload.group_id,
@@ -280,31 +281,13 @@ def generate_control_points(
         payload.academic_year,
         payload.semester,
     )
-    if current_teacher:
-        teacher = current_teacher
-        if payload.teacher_id and payload.teacher_id != teacher.id:
-            error(403, "JOURNAL_ACCESS_DENIED", "Нельзя назначить другого преподавателя")
-    else:
-        teacher = db.get(Teacher, payload.teacher_id) if payload.teacher_id else None
-        if not teacher:
-            teacher = db.scalar(
-                select(Teacher)
-                .join(JournalAssignment, JournalAssignment.teacher_id == Teacher.id)
-                .where(
-                    JournalAssignment.group_id == payload.group_id,
-                    JournalAssignment.subject_id == payload.subject_id,
-                    JournalAssignment.academic_year == payload.academic_year,
-                    JournalAssignment.semester == payload.semester,
-                    JournalAssignment.is_active.is_(True),
-                )
-                .limit(1)
-            )
-        if not teacher:
-            error(422, "JOURNAL_TEACHER_REQUIRED", "Для КТ не назначен преподаватель")
 
-    lesson_count = ceil(payload.total_practical_hours / payload.hours_per_lesson)
-    interval = ceil(lesson_count / 3)
-    positions = [min(interval, lesson_count), min(interval * 2, lesson_count), lesson_count]
+    interval = ceil(payload.total_practical_hours / 3)
+    planned_hours = [
+        ceil(payload.total_practical_hours / 3),
+        ceil(payload.total_practical_hours * 2 / 3),
+        payload.total_practical_hours,
+    ]
     lessons = db.scalars(
         select(JournalLesson)
         .where(
@@ -312,7 +295,6 @@ def generate_control_points(
             JournalLesson.subject_id == payload.subject_id,
             JournalLesson.lesson_date >= period.starts_on,
             JournalLesson.lesson_date <= period.ends_on,
-            JournalLesson.lesson_type.in_(("practice", "lab")),
             JournalLesson.status != "cancelled",
         )
         .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
@@ -329,21 +311,32 @@ def generate_control_points(
         ).all()
     }
     points: list[JournalControlPoint] = []
-    for number, position in enumerate(positions, start=1):
+    cumulative_hours = 0
+    lesson_hours: list[int] = []
+    for lesson in lessons:
+        cumulative_hours += lesson.hours
+        lesson_hours.append(cumulative_hours)
+
+    for number, target_hours in enumerate(planned_hours, start=1):
+        actual_index = next(
+            (index for index, value in enumerate(lesson_hours) if value >= target_hours),
+            None,
+        )
+        position = actual_index + 1 if actual_index is not None else len(lessons) + 1
         point = existing.get(number)
         if point and point.status == "locked":
             error(423, "JOURNAL_CONTROL_POINT_LOCKED", "Нельзя пересчитать закрытую КТ")
-        actual_lesson = lessons[position - 1] if len(lessons) >= position else None
+        actual_lesson = lessons[actual_index] if actual_index is not None else None
         if point is None:
             point = JournalControlPoint(
                 group_id=payload.group_id,
                 subject_id=payload.subject_id,
-                teacher_id=teacher.id,
                 period_id=period.id,
                 number=number,
                 planned_lesson_number=position,
+                planned_hours=target_hours,
                 total_practical_hours=payload.total_practical_hours,
-                hours_per_lesson=payload.hours_per_lesson,
+                hours_per_lesson=0,
                 current_max=CURRENT_MAX,
                 attendance_max=ATTENDANCE_MAX[number],
                 project_semester_max=PROJECT_SEMESTER_MAX,
@@ -359,10 +352,10 @@ def generate_control_points(
             )
         else:
             before = _point_state(point)
-            point.teacher_id = teacher.id
             point.planned_lesson_number = position
+            point.planned_hours = target_hours
             point.total_practical_hours = payload.total_practical_hours
-            point.hours_per_lesson = payload.hours_per_lesson
+            point.hours_per_lesson = 0
             point.attendance_max = ATTENDANCE_MAX[number]
             point.version += 1
             point.updated_by = me.id
@@ -401,9 +394,9 @@ def generate_control_points(
         db.rollback()
         error(409, "JOURNAL_CONTROL_POINT_CONFLICT", "КТ уже были изменены")
     return {
-        "lesson_count": lesson_count,
+        "lesson_count": len(lessons),
         "interval": interval,
-        "formula": f"ceil(({payload.total_practical_hours}/{payload.hours_per_lesson})/3)",
+        "formula": f"ceil({payload.total_practical_hours}/3)",
         "items": [_control_point_out(row) for row in points],
     }
 
@@ -525,8 +518,8 @@ def control_point_statement(
             "control_points": [23, 23, 24],
         },
         "attendance_policy": {
-            "type": "proportional_absence",
-            "formula": "attendance_max * (eligible_lessons - absences) / eligible_lessons",
+            "type": "proportional_absent_hours",
+            "formula": "attendance_max * attended_hours / eligible_hours",
             "note": "Ручная корректировка сохраняется до пересчёта с reset_manual=true",
         },
         "items": rows,
