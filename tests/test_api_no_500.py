@@ -64,6 +64,9 @@ from app.routers import (
     study,
     tests as tests_router,
     users,
+    journal,
+    admin_journal,
+    control_points,
 )
 from app.routers.admin import admin_delete_user
 from app.schemas.admin import SubjectCreateIn
@@ -314,6 +317,9 @@ def test_every_documented_endpoint_returns_no_500():
         grades.grated_router,
         tests_router.router,
         news_router.router,
+        journal.router,
+        admin_journal.router,
+        control_points.router,
     ):
         app.include_router(router)
 

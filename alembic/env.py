@@ -11,6 +11,7 @@ from app.db.base import Base
 
 from app.models import user, role, schedule, grade, news, profile, audit, achievement
 from app.models import application, document_order, material, subject_type, testing
+from app.models import journal
 from app.core.config import settings
 
 config = context.config

@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
@@ -9,6 +10,8 @@ from app.routers import materials, me, study, director, admin_schedule, achievem
 from app.routers import admin_user_import
 from app.routers import license as license_router
 from app.routers import tests
+from app.routers import journal, admin_journal, control_points
+from app.services.journal_service import JournalAPIError
 def custom_generate_unique_id(route):
     return f"{route.tags[0]}_{route.name}" if route.tags else route.name
 
@@ -38,6 +41,10 @@ app.add_middleware(
         "X-Import-Subject-Types-Created",
     ],
 )
+
+@app.exception_handler(JournalAPIError)
+async def journal_api_error_handler(_request: Request, exc: JournalAPIError):
+    return JSONResponse(status_code=exc.status_code, content=exc.detail)
 @app.get("/check_root")
 def check_root(request: Request):
     return {"root_path": request.scope.get("root_path")}
@@ -73,5 +80,8 @@ app.include_router(grades.router)
 app.include_router(grades.grated_router)
 app.include_router(tests.router)
 app.include_router(news.router)
+app.include_router(journal.router)
+app.include_router(admin_journal.router)
+app.include_router(control_points.router)
 
 app.mount("/lk", app)

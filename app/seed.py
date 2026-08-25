@@ -20,6 +20,8 @@ PERMS = [
     "grades:create", "grades:read", "grades:update", "grades:delete",
     "news:create", "news:read", "news:update", "news:delete",
     "audit:read",
+    "journal.read", "journal.lesson.write", "journal.entry.write",
+    "journal.topic.manage", "journal.period.lock", "journal.audit.read",
 ]
 
 ROLES = ["administrator", "director", "teacher", "student"]
@@ -65,6 +67,8 @@ def ensure(db: Session):
             upsert_role_perm(db, roles["teacher"].id, perm.id)
             upsert_role_perm(db, roles["student"].id, perm.id)
         if code.startswith("grades:") and code != "grades:delete":
+            upsert_role_perm(db, roles["teacher"].id, perm.id)
+        if code in {"journal.read", "journal.lesson.write", "journal.entry.write"}:
             upsert_role_perm(db, roles["teacher"].id, perm.id)
 
     def ensure_user(email, pwd, full_name, role_name, **kwargs) -> User:
