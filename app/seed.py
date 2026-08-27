@@ -70,6 +70,8 @@ def ensure(db: Session):
             upsert_role_perm(db, roles["teacher"].id, perm.id)
         if code in {"journal.read", "journal.lesson.write", "journal.entry.write"}:
             upsert_role_perm(db, roles["teacher"].id, perm.id)
+        if code == "journal.read":
+            upsert_role_perm(db, roles["student"].id, perm.id)
 
     def ensure_user(email, pwd, full_name, role_name, **kwargs) -> User:
         u = db.scalar(select(User).where(User.email == email))

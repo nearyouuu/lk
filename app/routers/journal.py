@@ -30,12 +30,14 @@ from app.services.journal_service import (
     JournalAPIError,
     add_audit,
     ensure_lesson_access,
+    ensure_journal_read_access,
     ensure_pair_access,
     ensure_permission,
     ensure_unlocked,
     entry_state,
     error,
     get_or_create_period,
+    get_student,
     get_teacher,
     grade_scale,
     has_permission,
@@ -102,6 +104,12 @@ def _request_id(request_id: str | None) -> str | None:
     return request_id[:100] if request_id else None
 
 
+def _student_viewer(db: Session, user: User) -> Student | None:
+    if is_privileged(db, user) or get_teacher(db, user, required=False) is not None:
+        return None
+    return get_student(db, user, required=False)
+
+
 @router.get("/catalog")
 def journal_catalog(
     academic_year: int,
@@ -113,10 +121,13 @@ def journal_catalog(
     ensure_permission(db, me, "journal.read")
     period_bounds(academic_year, semester)
     privileged = is_privileged(db, me)
+    student_viewer = _student_viewer(db, me)
     if teacher_id is not None and not privileged:
         error(403, "JOURNAL_ACCESS_DENIED", "teacher_id доступен только администратору")
 
-    if privileged:
+    if student_viewer is not None:
+        selected_teacher_id = None
+    elif privileged:
         selected_teacher_id = teacher_id
     else:
         selected_teacher_id = get_teacher(db, me).id
@@ -133,6 +144,10 @@ def journal_catalog(
             JournalAssignment.is_active.is_(True),
         )
     )
+    if student_viewer is not None:
+        assignment_query = assignment_query.where(
+            JournalAssignment.group_id == student_viewer.group_id
+        )
     if selected_teacher_id is not None:
         assignment_query = assignment_query.where(
             JournalAssignment.teacher_id == selected_teacher_id
@@ -175,6 +190,7 @@ def journal_catalog(
     return {
         "academic_year": academic_year,
         "semester": semester,
+        "access_scope": "self" if student_viewer is not None else "group",
         "groups": list(grouped.values()),
     }
 
@@ -190,6 +206,12 @@ def journal_group_students(
     group = db.get(Group, group_id)
     if not group:
         error(404, "JOURNAL_GROUP_NOT_FOUND", "Группа не найдена")
+
+    student_viewer = _student_viewer(db, me)
+    if student_viewer is not None:
+        if student_viewer.group_id != group_id:
+            error(403, "JOURNAL_ACCESS_DENIED", "Студенту доступна только его группа")
+        return {"group_id": group_id, "items": [_student_out(student_viewer)]}
 
     if not is_privileged(db, me):
         teacher = get_teacher(db, me)
@@ -241,9 +263,11 @@ def export_journal_excel(
         error(404, "JOURNAL_NOT_FOUND", "Группа или дисциплина не найдена")
 
     academic_year, semester = period_key_for_date(date_from)
-    ensure_pair_access(db, me, group_id, subject_id, academic_year, semester)
+    student_viewer = ensure_journal_read_access(
+        db, me, group_id, subject_id, academic_year, semester
+    )
 
-    lessons = db.scalars(
+    lesson_query = (
         select(JournalLesson)
         .options(
             joinedload(JournalLesson.topic),
@@ -257,7 +281,10 @@ def export_journal_excel(
             JournalLesson.lesson_date <= date_to,
         )
         .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
-    ).unique().all()
+    )
+    if student_viewer is not None:
+        lesson_query = lesson_query.where(JournalLesson.status == "published")
+    lessons = db.scalars(lesson_query).unique().all()
 
     snapshot_ids = {
         row.student_id for lesson in lessons for row in lesson.student_snapshots
@@ -266,12 +293,21 @@ def export_journal_excel(
         db.scalars(select(Student.id).where(Student.group_id == group_id)).all()
     )
     student_ids = snapshot_ids | current_ids
-    students = db.scalars(
-        select(Student)
-        .options(joinedload(Student.user))
-        .where(Student.id.in_(student_ids) if student_ids else False)
-    ).unique().all()
-    entries = [entry for lesson in lessons for entry in lesson.entries]
+    if student_viewer is not None:
+        students = [student_viewer]
+        entries = [
+            entry
+            for lesson in lessons
+            for entry in lesson.entries
+            if entry.student_id == student_viewer.id
+        ]
+    else:
+        students = db.scalars(
+            select(Student)
+            .options(joinedload(Student.user))
+            .where(Student.id.in_(student_ids) if student_ids else False)
+        ).unique().all()
+        entries = [entry for lesson in lessons for entry in lesson.entries]
 
     content = build_journal_workbook(
         group=group,
@@ -316,7 +352,7 @@ def get_journal(
         error(404, "JOURNAL_NOT_FOUND", "Группа или дисциплина не найдена")
 
     academic_year, semester = period_key_for_date(date_from)
-    ensure_pair_access(
+    student_viewer = ensure_journal_read_access(
         db, me, group_id, subject_id, academic_year, semester
     )
     period = db.scalar(
@@ -346,6 +382,8 @@ def get_journal(
         )
         .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
     )
+    if student_viewer is not None:
+        query = query.where(JournalLesson.status == "published")
     lessons = db.scalars(query).unique().all()
 
     snapshot_ids = {
@@ -355,13 +393,21 @@ def get_journal(
         db.scalars(select(Student.id).where(Student.group_id == group_id)).all()
     )
     student_ids = snapshot_ids | current_ids
-    students = db.scalars(
-        select(Student)
-        .options(joinedload(Student.user))
-        .where(Student.id.in_(student_ids) if student_ids else False)
-    ).unique().all()
+    if student_viewer is not None:
+        students = [student_viewer]
+    else:
+        students = db.scalars(
+            select(Student)
+            .options(joinedload(Student.user))
+            .where(Student.id.in_(student_ids) if student_ids else False)
+        ).unique().all()
     students.sort(key=student_full_name)
-    entries = [entry for lesson in lessons for entry in lesson.entries]
+    entries = [
+        entry
+        for lesson in lessons
+        for entry in lesson.entries
+        if student_viewer is None or entry.student_id == student_viewer.id
+    ]
 
     return {
         "group": {"id": group.id, "code": group.code},
@@ -375,9 +421,13 @@ def get_journal(
         "lessons": [_lesson_out(row) for row in lessons],
         "entries": [_entry_out(row) for row in entries],
         "permissions": {
-            "can_edit": not period.is_locked,
-            "can_manage_topics": has_permission(db, me, "journal.topic.manage"),
+            "can_edit": student_viewer is None and not period.is_locked,
+            "can_manage_topics": (
+                student_viewer is None
+                and has_permission(db, me, "journal.topic.manage")
+            ),
         },
+        "access_scope": "self" if student_viewer is not None else "group",
         "period": {"id": period.id, "is_locked": period.is_locked},
     }
 

@@ -41,6 +41,8 @@ from app.routers.journal import (
     create_journal_lesson,
     export_journal_excel,
     get_journal,
+    journal_catalog,
+    journal_group_students,
     put_journal_entries_batch,
     put_journal_entry,
 )
@@ -72,13 +74,14 @@ def _engine():
 def _fixture(db: Session):
     admin_role = Role(name="administrator")
     teacher_role = Role(name="teacher")
+    student_role = Role(name="student")
     admin = User(email="journal-admin@test.kz", password_hash="hash", full_name="Admin")
     teacher_user = User(
         email="journal-teacher@test.kz", password_hash="hash", full_name="Teacher"
     )
     group = Group(code="J-21", title="Journal group")
     subject = Subject(code="JOURNAL-01", title="Journal subject", grade_type="exam")
-    db.add_all([admin_role, teacher_role, admin, teacher_user, group, subject])
+    db.add_all([admin_role, teacher_role, student_role, admin, teacher_user, group, subject])
     db.flush()
     db.execute(
         user_roles.insert(),
@@ -96,6 +99,12 @@ def _fixture(db: Session):
                 role_id=teacher_role.id, permission_id=permission.id
             )
         )
+        if code == "journal.read":
+            db.execute(
+                role_permissions.insert().values(
+                    role_id=student_role.id, permission_id=permission.id
+                )
+            )
     teacher = Teacher(user_id=teacher_user.id, full_name="Teacher")
     db.add(teacher)
     students = []
@@ -107,6 +116,11 @@ def _fixture(db: Session):
         )
         db.add(student_user)
         db.flush()
+        db.execute(
+            user_roles.insert().values(
+                user_id=student_user.id, role_id=student_role.id
+            )
+        )
         student = Student(
             user_id=student_user.id,
             group_id=group.id,
@@ -628,4 +642,128 @@ def test_journal_excel_export_contains_hours_attendance_and_grades():
         assert sheet["H7"].value == 4
         assert sheet["I7"].value == 4.5
         assert workbook["Даты и темы"]["D4"].value == "Практическая работа № 1"
+    engine.dispose()
+
+
+def test_student_sees_only_own_read_only_journal_by_subject():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        admin, teacher_user, teacher, group, subject, students = _fixture(db)
+        create_journal_assignment(
+            JournalAssignmentCreate(
+                teacher_id=teacher.id,
+                group_id=group.id,
+                subject_id=subject.id,
+                academic_year=2026,
+                semester="autumn",
+            ),
+            db,
+            admin,
+        )
+        published = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 9, 1),
+                hours=4,
+                topic_text="Опубликованная тема",
+                status="published",
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 9, 8),
+                hours=2,
+                topic_text="Черновик",
+                status="draft",
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        for student, grade_value in zip(students, ("5", "2"), strict=True):
+            put_journal_entry(
+                published["id"],
+                student.id,
+                JournalEntryPut(attendance="present", grade=grade_value, version=0),
+                None,
+                db,
+                teacher_user,
+            )
+
+        student_user = students[0].user
+        catalog = journal_catalog(2026, "autumn", None, db, student_user)
+        assert catalog["access_scope"] == "self"
+        assert [row["id"] for row in catalog["groups"]] == [group.id]
+        assert [row["id"] for row in catalog["groups"][0]["subjects"]] == [subject.id]
+
+        group_students = journal_group_students(
+            group.id, date(2026, 9, 1), db, student_user
+        )
+        assert [row["id"] for row in group_students["items"]] == [students[0].id]
+
+        payload = get_journal(
+            group.id,
+            subject.id,
+            date(2026, 9, 1),
+            date(2026, 12, 31),
+            db,
+            student_user,
+        )
+        assert payload["access_scope"] == "self"
+        assert payload["permissions"] == {
+            "can_edit": False,
+            "can_manage_topics": False,
+        }
+        assert [row["id"] for row in payload["students"]] == [students[0].id]
+        assert [row["id"] for row in payload["lessons"]] == [published["id"]]
+        assert [row["student_id"] for row in payload["entries"]] == [students[0].id]
+        assert payload["entries"][0]["grade"] == "5"
+
+        export_response = export_journal_excel(
+            group.id,
+            subject.id,
+            date(2026, 9, 1),
+            date(2026, 12, 31),
+            db,
+            student_user,
+        )
+        exported_book = load_workbook(BytesIO(export_response.body), read_only=True)
+        exported_sheet = exported_book["Учебный журнал"]
+        assert exported_sheet["B7"].value == "Student 0"
+        assert exported_sheet["B8"].value is None
+        assert exported_sheet["E7"].value == "5"
+
+        with pytest.raises(JournalAPIError) as write_denied:
+            put_journal_entry(
+                published["id"],
+                students[0].id,
+                JournalEntryPut(attendance="absent", grade="3", version=1),
+                None,
+                db,
+                student_user,
+            )
+        assert write_denied.value.status_code == 403
+
+        other_group = Group(code="J-22", title="Other group")
+        db.add(other_group)
+        db.commit()
+        with pytest.raises(JournalAPIError) as other_group_denied:
+            get_journal(
+                other_group.id,
+                subject.id,
+                date(2026, 9, 1),
+                date(2026, 12, 31),
+                db,
+                student_user,
+            )
+        assert other_group_denied.value.status_code == 403
     engine.dispose()

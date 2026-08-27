@@ -89,6 +89,13 @@ def get_teacher(db: Session, user: User, required: bool = True) -> Teacher | Non
     return teacher
 
 
+def get_student(db: Session, user: User, required: bool = True) -> Student | None:
+    student = db.scalar(select(Student).where(Student.user_id == user.id))
+    if required and not student:
+        error(403, "JOURNAL_STUDENT_PROFILE_REQUIRED", "Профиль студента не найден")
+    return student
+
+
 def period_bounds(academic_year: int, semester: str) -> tuple[date, date]:
     if semester == "autumn":
         return date(academic_year, 8, 1), date(academic_year + 1, 1, 31)
@@ -179,6 +186,54 @@ def ensure_pair_access(
     ):
         error(403, "JOURNAL_ACCESS_DENIED", "Журнал не назначен текущему преподавателю")
     return teacher
+
+
+def student_has_journal_access(
+    db: Session,
+    student: Student,
+    group_id: int,
+    subject_id: int,
+    academic_year: int,
+    semester: str,
+) -> bool:
+    if student.group_id != group_id:
+        return False
+    return bool(
+        db.scalar(
+            select(JournalAssignment.id).where(
+                JournalAssignment.group_id == group_id,
+                JournalAssignment.subject_id == subject_id,
+                JournalAssignment.academic_year == academic_year,
+                JournalAssignment.semester == semester,
+                JournalAssignment.is_active.is_(True),
+            ).limit(1)
+        )
+    )
+
+
+def ensure_journal_read_access(
+    db: Session,
+    user: User,
+    group_id: int,
+    subject_id: int,
+    academic_year: int,
+    semester: str,
+) -> Student | None:
+    """Return the student profile for self-scoped reads, otherwise validate staff access."""
+    if not is_privileged(db, user) and get_teacher(db, user, required=False) is None:
+        student = get_student(db, user, required=False)
+        if student is not None:
+            if not student_has_journal_access(
+                db, student, group_id, subject_id, academic_year, semester
+            ):
+                error(
+                    403,
+                    "JOURNAL_ACCESS_DENIED",
+                    "Дисциплина недоступна студенту текущей группы",
+                )
+            return student
+    ensure_pair_access(db, user, group_id, subject_id, academic_year, semester)
+    return None
 
 
 def ensure_lesson_access(db: Session, user: User, lesson: JournalLesson) -> Teacher | None:
