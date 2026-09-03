@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.schedule import Group, Lesson, LessonTime, Room, Subject, Teacher
 from app.schemas.schedule import LessonCreate
 from app.services.subject_service import resolve_subject
+from app.services.subject_teacher_service import ensure_teacher_linked_to_subject
 
 
 def get_or_create(db, model, where: dict, defaults: dict = {}):
@@ -65,6 +66,9 @@ def create_lesson(db: Session, payload: LessonCreate):
         teacher_id = teacher.id
     else:
         teacher_id = None
+
+    if teacher_id is not None:
+        ensure_teacher_linked_to_subject(db, teacher_id, subject_id)
 
     if payload.lesson_number is not None:
         lt = db.scalar(select(LessonTime).where(LessonTime.lesson_number == payload.lesson_number))

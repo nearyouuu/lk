@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Literal
 
 class SubjectTypeBase(BaseModel):
@@ -23,5 +23,10 @@ class SubjectBase(BaseModel):
 
 class SubjectOut(SubjectBase):
     id: int
+    teacher_ids: list[int] = Field(default_factory=list)
+    teachers: list[dict] = Field(default_factory=list)
+    primary_teacher_id: int | None = None
+    primary_teacher_name: str | None = None
+
     class Config:
         orm_mode = True

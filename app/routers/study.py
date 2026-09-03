@@ -7,10 +7,9 @@ from app.models.grade import Student as StudentModel, Grade
 from app.models.schedule import Group, Subject, Lesson, Teacher
 from app.schemas.user import MeOut
 from app.models.user import User
+from app.services.subject_teacher_service import subject_teacher_payload
 
 router = APIRouter(prefix="/students", tags=["study"])
-
-from sqlalchemy.orm import selectinload
 
 @router.get("/{student_id}/study/overview")
 def student_study_overview(
@@ -33,6 +32,7 @@ def student_study_overview(
         select(Subject)
         .options(
             selectinload(Subject.primary_teacher),
+            selectinload(Subject.teachers),
         )
         .join(Lesson, Lesson.subject_id == Subject.id)
         .where(Lesson.group_id == group.id)
@@ -75,6 +75,7 @@ def student_study_overview(
             "subject_code": s.code,
             "primary_teacher_id": s.primary_teacher_id,
             "primary_teacher_name": s.primary_teacher.full_name if s.primary_teacher else None,
+            **subject_teacher_payload(s),
             "grade_type": s.grade_type,
             "grades": [],
             "final_grade": None,
@@ -135,7 +136,9 @@ def all_students_study_overview(
         if not group:
             continue
 
-        subj_q = select(Subject).options(selectinload(Subject.primary_teacher)) \
+        subj_q = select(Subject).options(
+            selectinload(Subject.primary_teacher), selectinload(Subject.teachers)
+        ) \
             .join(Lesson, Lesson.subject_id == Subject.id) \
             .where(Lesson.group_id == group.id)
         if date_from:
@@ -167,6 +170,7 @@ def all_students_study_overview(
                 "subject_code": s.code,
                 "primary_teacher_id": s.primary_teacher_id,
                 "primary_teacher_name": s.primary_teacher.full_name if s.primary_teacher else None,
+                **subject_teacher_payload(s),
                 "grade_type": s.grade_type,
                 "grades": [],
                 "final_grade": None, 

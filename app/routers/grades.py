@@ -149,7 +149,7 @@ def create_grade(payload: GradeCreate, db: Session = Depends(get_db), me=Depends
                 teacher_subjects.c.subject_id == subj_id
             )
         )
-        if not is_linked and lesson.teacher_id != teacher_profile.id:
+        if not is_linked:
             raise HTTPException(status_code=403, detail="Teacher is not assigned to this subject")
 
         final_teacher_id = teacher_profile.id

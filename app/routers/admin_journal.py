@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.deps import get_current_user, get_db
 from app.models.journal import (
@@ -25,6 +25,10 @@ from app.services.journal_service import (
     get_or_create_period,
     has_permission,
     is_privileged,
+)
+from app.services.subject_teacher_service import (
+    subject_teacher_payload,
+    teacher_is_linked_to_subject,
 )
 
 
@@ -172,7 +176,8 @@ def list_journal_assignments(
     query = select(JournalAssignment).options(
         joinedload(JournalAssignment.teacher),
         joinedload(JournalAssignment.group),
-        joinedload(JournalAssignment.subject),
+        joinedload(JournalAssignment.subject).selectinload(Subject.teachers),
+        joinedload(JournalAssignment.subject).joinedload(Subject.primary_teacher),
     )
     for column, value in (
         (JournalAssignment.academic_year, academic_year),
@@ -191,7 +196,13 @@ def _assignment_out(row: JournalAssignment) -> dict:
         "id": row.id,
         "teacher": {"id": row.teacher.id, "full_name": row.teacher.full_name},
         "group": {"id": row.group.id, "code": row.group.code},
-        "subject": {"id": row.subject.id, "code": row.subject.code, "title": row.subject.title},
+        "subject": {
+            "id": row.subject.id,
+            "code": row.subject.code,
+            "title": row.subject.title,
+            "grade_type": row.subject.grade_type,
+            **subject_teacher_payload(row.subject),
+        },
         "academic_year": row.academic_year,
         "semester": row.semester,
         "is_active": row.is_active,
@@ -210,6 +221,13 @@ def create_journal_assignment(
     subject = db.get(Subject, payload.subject_id)
     if not teacher or not group or not subject:
         error(404, "JOURNAL_ASSIGNMENT_REFERENCE_NOT_FOUND", "Преподаватель, группа или дисциплина не найдены")
+    if not teacher_is_linked_to_subject(db, teacher.id, subject.id):
+        error(
+            422,
+            "JOURNAL_TEACHER_NOT_LINKED",
+            "Преподаватель не связан с выбранной дисциплиной",
+            {"teacher_id": teacher.id, "subject_id": subject.id},
+        )
     assignment = db.scalar(
         select(JournalAssignment).where(
             JournalAssignment.teacher_id == payload.teacher_id,

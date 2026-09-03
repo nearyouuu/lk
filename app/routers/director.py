@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from app.core.deps import get_db, require_role_any
 from app.models.user import User
 from app.models.schedule import Group, Teacher, Subdivision, Subject
@@ -17,9 +17,16 @@ router = APIRouter(
 def list_groups(db: Session = Depends(get_db), q: str | None = Query(None)):
     stmt = select(Group)
     if q:
-        stmt = stmt.where(Group.code.ilike(f"%{q}%") | Group.title.ilike(f"%{q}%"))
+        stmt = stmt.where(or_(
+            Group.identifier.ilike(f"%{q}%"),
+            Group.code.ilike(f"%{q}%"),
+            Group.title.ilike(f"%{q}%"),
+        ))
     groups = db.scalars(stmt).all()
-    return [{"id": g.id, "code": g.code, "title": g.title} for g in groups]
+    return [
+        {"id": g.id, "identifier": g.identifier, "code": g.code, "title": g.title}
+        for g in groups
+    ]
 
 @router.get("/teachers")
 def list_teachers(db: Session = Depends(get_db), q: str | None = Query(None), subdivision_id: int | None = Query(None)):

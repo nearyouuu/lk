@@ -5,9 +5,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.schemas.lesson_types import LessonType
+
 
 Semester = Literal["autumn", "spring"]
-LessonType = Literal["lecture", "practice", "lab"]
 LessonStatus = Literal["draft", "published", "cancelled"]
 Attendance = Literal["present", "absent", "late", "excused"]
 
@@ -20,7 +21,7 @@ class JournalLessonCreate(BaseModel):
     hours: int = Field(default=2, ge=1, le=24)
     starts_at: TimeType | None = None
     ends_at: TimeType | None = None
-    type: LessonType = "practice"
+    type: LessonType | None = None
     topic_id: int | None = None
     topic_text: str | None = Field(default=None, max_length=500)
     comment: str | None = None
@@ -36,6 +37,8 @@ class JournalLessonCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_times(self):
+        if self.schedule_lesson_id is None and self.type is None:
+            raise ValueError("type is required for a manual journal lesson")
         if self.starts_at and self.ends_at and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be later than starts_at")
         return self
@@ -59,6 +62,12 @@ class JournalLessonPatch(BaseModel):
         if value is None:
             return None
         return value.strip() or None
+
+    @model_validator(mode="after")
+    def validate_type(self):
+        if "type" in self.model_fields_set and self.type is None:
+            raise ValueError("type cannot be null")
+        return self
 
 
 class JournalEntryPut(BaseModel):

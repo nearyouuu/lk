@@ -1,8 +1,11 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional
 
-SubjectType = Literal["lecture", "practice", "lab"]
+from app.schemas.lesson_types import LessonType
+
+# Transitional public alias used by existing schedule code.
+SubjectType = LessonType
 
 class LessonCreate(BaseModel):
     group_code: str

@@ -6,6 +6,7 @@ os.environ["DATABASE_URL"] = "sqlite://"
 
 import pytest
 from openpyxl import load_workbook
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -28,7 +29,7 @@ from app.models import (  # noqa: F401
     user,
 )
 from app.models.grade import Student
-from app.models.journal import JournalEntry, JournalPeriod
+from app.models.journal import JournalAuditEvent, JournalEntry, JournalPeriod
 from app.models.role import Permission, Role, role_permissions, user_roles
 from app.models.schedule import Group, Lesson, Subject, Teacher
 from app.models.user import User
@@ -43,6 +44,7 @@ from app.routers.journal import (
     get_journal,
     journal_catalog,
     journal_group_students,
+    patch_journal_lesson,
     put_journal_entries_batch,
     put_journal_entry,
 )
@@ -56,6 +58,7 @@ from app.schemas.journal import (
     JournalBatchPut,
     JournalEntryPut,
     JournalLessonCreate,
+    JournalLessonPatch,
     SubjectTopicCreate,
     ControlPointScorePut,
     ControlPointsGenerate,
@@ -107,6 +110,9 @@ def _fixture(db: Session):
             )
     teacher = Teacher(user_id=teacher_user.id, full_name="Teacher")
     db.add(teacher)
+    db.flush()
+    subject.teachers.append(teacher)
+    subject.primary_teacher = teacher
     students = []
     for index in range(2):
         student_user = User(
@@ -466,6 +472,7 @@ def test_assigned_teachers_share_the_same_journal_lessons():
         )
         second_teacher = Teacher(user_id=second_user.id, full_name="Second Teacher")
         db.add(second_teacher)
+        subject.teachers.append(second_teacher)
         db.commit()
 
         for teacher in (first_teacher, second_teacher):
@@ -580,6 +587,7 @@ def test_journal_excel_export_contains_hours_attendance_and_grades():
                 subject_id=subject.id,
                 date=date(2026, 9, 1),
                 hours=4,
+                type="practice",
                 topic_text="Практическая работа № 1",
             ),
             None,
@@ -593,6 +601,7 @@ def test_journal_excel_export_contains_hours_attendance_and_grades():
                 subject_id=subject.id,
                 date=date(2026, 9, 8),
                 hours=2,
+                type="lab",
             ),
             None,
             None,
@@ -641,7 +650,8 @@ def test_journal_excel_export_contains_hours_attendance_and_grades():
         assert sheet["G7"].value == "5"
         assert sheet["H7"].value == 4
         assert sheet["I7"].value == 4.5
-        assert workbook["Даты и темы"]["D4"].value == "Практическая работа № 1"
+        assert workbook["Даты и темы"]["D4"].value == "Практическое занятие"
+        assert workbook["Даты и темы"]["E4"].value == "Практическая работа № 1"
     engine.dispose()
 
 
@@ -667,6 +677,7 @@ def test_student_sees_only_own_read_only_journal_by_subject():
                 subject_id=subject.id,
                 date=date(2026, 9, 1),
                 hours=4,
+                type="practice",
                 topic_text="Опубликованная тема",
                 status="published",
             ),
@@ -681,6 +692,7 @@ def test_student_sees_only_own_read_only_journal_by_subject():
                 subject_id=subject.id,
                 date=date(2026, 9, 8),
                 hours=2,
+                type="lecture",
                 topic_text="Черновик",
                 status="draft",
             ),
@@ -766,4 +778,117 @@ def test_student_sees_only_own_read_only_journal_by_subject():
                 student_user,
             )
         assert other_group_denied.value.status_code == 403
+    engine.dispose()
+
+
+def test_journal_lesson_types_are_required_patchable_and_audited():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        admin, teacher_user, teacher, group, subject, _ = _fixture(db)
+        create_journal_assignment(
+            JournalAssignmentCreate(
+                teacher_id=teacher.id,
+                group_id=group.id,
+                subject_id=subject.id,
+                academic_year=2026,
+                semester="autumn",
+            ),
+            db,
+            admin,
+        )
+
+        with pytest.raises(ValidationError):
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 10, 1),
+            )
+
+        created = []
+        for offset, lesson_type in enumerate(("lecture", "practice", "lab"), start=1):
+            created.append(
+                create_journal_lesson(
+                    JournalLessonCreate(
+                        group_id=group.id,
+                        subject_id=subject.id,
+                        date=date(2026, 10, offset),
+                        type=lesson_type,
+                    ),
+                    None,
+                    None,
+                    db,
+                    teacher_user,
+                )
+            )
+        assert [lesson["type"] for lesson in created] == ["lecture", "practice", "lab"]
+
+        updated = patch_journal_lesson(
+            created[0]["id"],
+            JournalLessonPatch(version=created[0]["version"], type="lab"),
+            "lesson-type-test",
+            db,
+            teacher_user,
+        )
+        assert updated["type"] == "lab"
+        assert updated["version"] == created[0]["version"] + 1
+
+        audit = db.scalar(
+            select(JournalAuditEvent)
+            .where(
+                JournalAuditEvent.lesson_id == created[0]["id"],
+                JournalAuditEvent.operation == "update",
+            )
+            .order_by(JournalAuditEvent.id.desc())
+        )
+        assert audit.before["type"] == "lecture"
+        assert audit.after["type"] == "lab"
+
+        with pytest.raises(ValidationError):
+            JournalLessonPatch(version=updated["version"], type=None)
+    engine.dispose()
+
+
+def test_schedule_linked_journal_lesson_copies_schedule_type():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        admin, teacher_user, teacher, group, subject, _ = _fixture(db)
+        create_journal_assignment(
+            JournalAssignmentCreate(
+                teacher_id=teacher.id,
+                group_id=group.id,
+                subject_id=subject.id,
+                academic_year=2026,
+                semester="autumn",
+            ),
+            db,
+            admin,
+        )
+        scheduled = Lesson(
+            group_id=group.id,
+            subject_id=subject.id,
+            teacher_id=teacher.id,
+            lesson_number=1,
+            starts_at=datetime(2026, 10, 15, 9, 0),
+            ends_at=datetime(2026, 10, 15, 10, 30),
+            subject_type="lecture",
+        )
+        db.add(scheduled)
+        db.commit()
+
+        lesson = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 10, 15),
+                schedule_lesson_id=scheduled.id,
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        assert lesson["type"] == "lecture"
+        assert lesson["source"] == "schedule"
     engine.dispose()

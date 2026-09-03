@@ -25,6 +25,7 @@ from app.schemas.journal import (
     JournalEntryPut,
     JournalLessonCreate,
     JournalLessonPatch,
+    LessonType,
 )
 from app.services.journal_service import (
     JournalAPIError,
@@ -51,6 +52,10 @@ from app.services.journal_service import (
     validate_grade,
 )
 from app.services.journal_export import JOURNAL_EXPORT_MEDIA_TYPE, build_journal_workbook
+from app.services.subject_teacher_service import (
+    subject_teacher_payload,
+    teacher_is_linked_to_subject,
+)
 
 
 router = APIRouter(prefix="/api/v1/journal", tags=["journal"])
@@ -136,7 +141,8 @@ def journal_catalog(
         select(JournalAssignment)
         .options(
             joinedload(JournalAssignment.group),
-            joinedload(JournalAssignment.subject),
+            joinedload(JournalAssignment.subject).selectinload(Subject.teachers),
+            joinedload(JournalAssignment.subject).joinedload(Subject.primary_teacher),
         )
         .where(
             JournalAssignment.academic_year == academic_year,
@@ -185,6 +191,7 @@ def journal_catalog(
                 "code": subject.code,
                 "title": subject.title,
                 "grade_scale": grade_scale(subject),
+                **subject_teacher_payload(subject),
             }
         )
     return {
@@ -342,12 +349,17 @@ def get_journal(
     date_to: date,
     db: Session = Depends(get_db),
     me: User = Depends(get_current_user),
+    type: LessonType | None = None,
 ):
     ensure_permission(db, me, "journal.read")
     if date_to < date_from:
         error(422, "JOURNAL_INVALID_DATE_RANGE", "date_to должен быть не раньше date_from")
     group = db.get(Group, group_id)
-    subject = db.get(Subject, subject_id)
+    subject = db.scalar(
+        select(Subject)
+        .options(selectinload(Subject.teachers), joinedload(Subject.primary_teacher))
+        .where(Subject.id == subject_id)
+    )
     if not group or not subject:
         error(404, "JOURNAL_NOT_FOUND", "Группа или дисциплина не найдена")
 
@@ -384,6 +396,8 @@ def get_journal(
     )
     if student_viewer is not None:
         query = query.where(JournalLesson.status == "published")
+    if type is not None:
+        query = query.where(JournalLesson.lesson_type == type)
     lessons = db.scalars(query).unique().all()
 
     snapshot_ids = {
@@ -415,7 +429,9 @@ def get_journal(
             "id": subject.id,
             "code": subject.code,
             "title": subject.title,
+            "grade_type": subject.grade_type,
             "grade_scale": grade_scale(subject),
+            **subject_teacher_payload(subject),
         },
         "students": [_student_out(row) for row in students],
         "lessons": [_lesson_out(row) for row in lessons],
@@ -507,6 +523,7 @@ def create_journal_lesson(
                 {"teacher_ids": assigned_teacher_ids},
             )
 
+    lesson_type = payload.type or "practice"
     if payload.schedule_lesson_id is not None:
         schedule_lesson = db.get(Lesson, payload.schedule_lesson_id)
         if not schedule_lesson:
@@ -532,6 +549,25 @@ def create_journal_lesson(
                 "Занятие расписания уже добавлено в журнал",
                 {"journal_lesson_id": linked_lesson_id},
             )
+        if schedule_lesson.subject_type is None:
+            lesson_type = "practice"
+        elif schedule_lesson.subject_type in {"lecture", "practice", "lab"}:
+            lesson_type = schedule_lesson.subject_type
+        else:
+            error(
+                422,
+                "JOURNAL_INVALID_LESSON_TYPE",
+                "Тип занятия расписания не поддерживается",
+                {"type": schedule_lesson.subject_type},
+            )
+
+    if not teacher_is_linked_to_subject(db, teacher.id, subject.id):
+        error(
+            422,
+            "JOURNAL_TEACHER_NOT_LINKED",
+            "Преподаватель не связан с выбранной дисциплиной",
+            {"teacher_id": teacher.id, "subject_id": subject.id},
+        )
 
     topic = None
     if payload.topic_id:
@@ -560,7 +596,7 @@ def create_journal_lesson(
         hours=payload.hours,
         starts_at=payload.starts_at,
         ends_at=payload.ends_at,
-        lesson_type=payload.type,
+        lesson_type=lesson_type,
         topic_id=topic.id if topic else None,
         topic_text=topic_text,
         comment=payload.comment,

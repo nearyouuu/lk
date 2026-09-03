@@ -1,13 +1,11 @@
 from datetime import datetime, time
+from uuid import uuid4
 from sqlalchemy import (
     Integer, String, DateTime, ForeignKey, Text,
     Table, Column, Time, CheckConstraint
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
-from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import Integer, Time
-from datetime import time
 
 teacher_subjects = Table(
     "teacher_subjects",
@@ -20,7 +18,10 @@ teacher_subjects = Table(
 class Group(Base):
     __tablename__ = "groups"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    identifier: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, default=lambda: str(uuid4())
+    )
+    code: Mapped[str] = mapped_column(String(50), index=True)
     title: Mapped[str] = mapped_column(String(255))
 
     students = relationship("Student", back_populates="group", cascade="all, delete-orphan")
@@ -54,7 +55,9 @@ class Subject(Base):
     )
     primary_teacher = relationship("Teacher", foreign_keys=[primary_teacher_id])
 
-    teachers = relationship("Teacher", secondary=teacher_subjects, back_populates="subjects")
+    teachers = relationship(
+        "Teacher", secondary=teacher_subjects, back_populates="subjects", order_by="Teacher.id"
+    )
 
 lesson_teachers = Table(
     "lesson_teachers",

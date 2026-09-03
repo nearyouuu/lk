@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from datetime import date, datetime
 from typing import List, Optional, Literal
 
@@ -41,8 +41,17 @@ class RolePermissionAssignIn(BaseModel):
     permissions: List[str]
 
 class GroupCreateIn(BaseModel):
+    identifier: str
     code: str
     title: str
+
+    @field_validator("identifier", "code", "title")
+    @classmethod
+    def normalize_group_fields(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Field must not be empty")
+        return value
 
 class TeacherCreateIn(BaseModel):
     full_name: str
@@ -74,8 +83,13 @@ class SubjectCreateIn(BaseModel):
     subject_code: Optional[str] = None
     # Legacy alias for clients deployed before subject_code became canonical.
     code: Optional[str] = None
-    teacher_id: Optional[int] = None
+    teacher_ids: List[int] = Field(min_length=1)
     grade_type: Literal["exam", "зачет"]
+
+    @field_validator("teacher_ids")
+    @classmethod
+    def normalize_teacher_ids(cls, value: List[int]) -> List[int]:
+        return list(dict.fromkeys(value))
 
     @field_validator("title")
     @classmethod

@@ -35,6 +35,16 @@ def detect_subject_type(subject_title: str) -> str | None:
     return None
 
 
+def optional_text(row: pd.Series, *column_names: str) -> str | None:
+    for column_name in column_names:
+        value = row.get(column_name)
+        if pd.notna(value):
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
 def parse_schedule_excel(file_path: str, db: Session) -> int:
     df = pd.read_excel(file_path)
 
@@ -64,6 +74,11 @@ def parse_schedule_excel(file_path: str, db: Session) -> int:
         subject = get_or_create(db, Subject, title=subject_title)
         teacher = get_or_create(db, Teacher, full_name=teacher_name) if teacher_name else None
         room = get_or_create(db, Room, code=room_code, defaults={"title": room_code})
+        if teacher and teacher not in subject.teachers:
+            subject.teachers.append(teacher)
+            if subject.primary_teacher_id is None:
+                subject.primary_teacher = teacher
+            db.flush()
 
         payload = LessonCreate(
             group_code=group_code,
@@ -71,7 +86,8 @@ def parse_schedule_excel(file_path: str, db: Session) -> int:
             starts_at=starts_at,
             ends_at=ends_at,
             subject_type=subject_type,
-            notes=str(row.get("Комментарий")).strip() if pd.notna(row.get("Комментарий")) else None,
+            topic=optional_text(row, "Тема занятия", "Тема"),
+            notes=optional_text(row, "Комментарий"),
             subject_id=subject.id,
             teacher_id=teacher.id if teacher else None,
             subject_title=subject.title,

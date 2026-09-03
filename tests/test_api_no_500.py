@@ -190,7 +190,7 @@ def test_subject_duplicate_check_uses_only_code():
             SubjectCreateIn(
                 title="Одинаковое название",
                 subject_code="SUBJ-001",
-                teacher_id=teacher.id,
+                teacher_ids=[teacher.id],
                 grade_type="exam",
             ),
             db,
@@ -199,7 +199,7 @@ def test_subject_duplicate_check_uses_only_code():
             SubjectCreateIn(
                 title="Одинаковое название",
                 subject_code="SUBJ-002",
-                teacher_id=teacher.id,
+                teacher_ids=[teacher.id],
                 grade_type="exam",
             ),
             db,
@@ -213,7 +213,7 @@ def test_subject_duplicate_check_uses_only_code():
                 SubjectCreateIn(
                     title="Другое название",
                     subject_code="SUBJ-001",
-                    teacher_id=teacher.id,
+                    teacher_ids=[teacher.id],
                     grade_type="exam",
                 ),
                 db,
@@ -230,7 +230,7 @@ def test_subject_duplicate_check_uses_only_code():
                 SubjectCreateIn(
                     title="Одинаковое название",
                     subject_code="SUBJ-001",
-                    teacher_id=teacher.id,
+                    teacher_ids=[teacher.id],
                     grade_type="exam",
                 ),
                 db,
@@ -253,6 +253,7 @@ def test_public_subject_contract_uses_subject_code():
 
     for component_name, field_name in (
         ("SubjectCreateIn", "subject_code"),
+        ("SubjectCreateIn", "teacher_ids"),
         ("LessonCreate", "subject_code"),
         ("LessonUpdate", "subject_code"),
         ("LessonOut", "subject_code"),

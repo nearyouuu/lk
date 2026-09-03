@@ -35,7 +35,10 @@ USER_COLUMNS = {
     "role": ("роль", "role"),
     "phone": ("телефон", "phone"),
     "birth_date": ("дата рождения", "birth date", "birth_date"),
-    "group": ("группа", "group", "код группы"),
+    "group_identifier": (
+        "идентификатор группы", "group identifier", "group_identifier",
+        "группа", "group", "код группы",
+    ),
     "subject": ("предмет", "subject"),
     "subdivision": ("подразделение", "код подразделения", "subdivision"),
     "record_book": ("номер зачетки", "номер зачётки", "record book", "record_book"),
@@ -43,6 +46,7 @@ USER_COLUMNS = {
     "course": ("курс", "course"),
 }
 GROUP_COLUMNS = {
+    "identifier": ("идентификатор группы", "group identifier", "group_identifier", "identifier", "id группы"),
     "code": ("код группы", "код", "group code", "code"),
     "title": ("название группы", "название", "group title", "title"),
 }
@@ -159,20 +163,20 @@ def _email_list(value: str) -> list[str]:
     return result
 
 
-def _split_group(value: str) -> tuple[str, str]:
-    parts = [part.strip() for part in value.split(",", 1)]
-    code = parts[0] if parts else ""
-    title = parts[1] if len(parts) == 2 and parts[1] else code
-    if not code:
+def _require_group_identifier(value: str) -> str:
+    identifier = value.strip()
+    if not identifier:
         raise ValueError("для студента не указана группа")
-    return code, title
+    return identifier
 
 
-def _get_or_create_group(db: Session, code: str, title: str) -> tuple[Group, bool]:
-    group = db.scalar(select(Group).where(Group.code == code))
+def _get_or_create_group(
+    db: Session, identifier: str, code: str, title: str
+) -> tuple[Group, bool]:
+    group = db.scalar(select(Group).where(Group.identifier == identifier))
     if group:
         return group, False
-    group = Group(code=code, title=title or code)
+    group = Group(identifier=identifier, code=code, title=title or code)
     db.add(group)
     db.flush()
     return group, True
@@ -264,7 +268,11 @@ def _validate_columns(frames: dict[str, pd.DataFrame], present: set[str]) -> dic
     }
     definitions = {
         "users": (USER_COLUMNS, {"full_name", "email", "role"}, "ФИО, Электронная почта, Роль"),
-        "groups": (GROUP_COLUMNS, {"code"}, "Код группы"),
+        "groups": (
+            GROUP_COLUMNS,
+            {"identifier", "code", "title"},
+            "Идентификатор группы, Код группы, Название группы",
+        ),
         "subdivisions": (SUBDIVISION_COLUMNS, {"name"}, "Название подразделения"),
         "rooms": (ROOM_COLUMNS, {"code"}, "Код аудитории"),
         "subjects": (SUBJECT_COLUMNS, {"title"}, "Название дисциплины"),
@@ -330,14 +338,21 @@ def import_users_from_excel(db: Session, file_path: str, export_dir: str = "expo
 
         # 2. Группы.
         for index, row in frames["groups"].iterrows():
+            identifier = _value(row, columns["groups"], "identifier")
             code = _value(row, columns["groups"], "code")
-            title = _value(row, columns["groups"], "title") or code
-            report = {"Строка": index + 2, "Код группы": code, "Название группы": title}
-            if not code:
+            title = _value(row, columns["groups"], "title")
+            report = {"Строка": index + 2, "Идентификатор группы": identifier, "Код группы": code, "Название группы": title}
+            if not identifier:
+                failed += 1
+                report.update({"Статус": "Ошибка", "Комментарий": "не указан идентификатор группы"})
+            elif not code:
                 failed += 1
                 report.update({"Статус": "Ошибка", "Комментарий": "не указан код группы"})
+            elif not title:
+                failed += 1
+                report.update({"Статус": "Ошибка", "Комментарий": "не указано название группы"})
             else:
-                _, was_created = _get_or_create_group(db, code, title)
+                _, was_created = _get_or_create_group(db, identifier, code, title)
                 groups_created += int(was_created)
                 report.update({"Статус": "Создана" if was_created else "Пропущена", "Комментарий": "" if was_created else "группа уже существует"})
             reports["groups"].append(report)
@@ -372,9 +387,17 @@ def import_users_from_excel(db: Session, file_path: str, export_dir: str = "expo
                 birth_date = _parse_date(row[columns["users"]["birth_date"]]) if columns["users"].get("birth_date") else None
                 group = None
                 if role_name == "student":
-                    group_code, group_title = _split_group(_value(row, columns["users"], "group"))
-                    group, was_created = _get_or_create_group(db, group_code, group_title)
-                    groups_created += int(was_created)
+                    group_identifier = _require_group_identifier(
+                        _value(row, columns["users"], "group_identifier")
+                    )
+                    group = db.scalar(
+                        select(Group).where(Group.identifier == group_identifier)
+                    )
+                    if group is None:
+                        raise ValueError(
+                            f"группа с идентификатором «{group_identifier}» не найдена; "
+                            "сначала добавьте её на лист «Группы»"
+                        )
                 subdivision = None
                 if role_name == "teacher" and _value(row, columns["users"], "subdivision"):
                     subdivision_value = _value(row, columns["users"], "subdivision")
@@ -459,7 +482,10 @@ def import_users_from_excel(db: Session, file_path: str, export_dir: str = "expo
                     teacher = _find_teacher(db, email)
                     if teacher is None:
                         raise ValueError(f"преподаватель «{email}» не найден")
-                    teachers.append(teacher)
+                    if teacher not in teachers:
+                        teachers.append(teacher)
+                if teachers and primary_teacher is None:
+                    primary_teacher = teachers[0]
 
                 subject_type = None
                 if type_name:

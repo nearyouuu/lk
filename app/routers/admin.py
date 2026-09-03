@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
-from sqlalchemy.orm import Session
-from sqlalchemy import select, delete, or_, func, text
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import select, delete, or_, func, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from datetime import date, datetime
 from typing import List
@@ -17,6 +17,7 @@ from app.models.profile import AdminProfile, Director
 from app.models.schedule import Group, Teacher, Room, Subject, Subdivision, teacher_subjects
 from app.models.audit import AuditLog
 from app.models.schedule import Lesson
+from app.models.journal import JournalAssignment
 from app.schemas.schedule import LessonUpdate
 
 from app.schemas.user import (MeAdmin, MeDirector, MeTeacher, MeStudent,
@@ -33,6 +34,11 @@ from app.schemas.admin import (
 
 from app.models.subject_type import SubjectType
 from app.schemas.subject import SubjectTypeOut, SubjectTypeCreate, SubjectTypeUpdate
+from app.services.subject_teacher_service import (
+    ensure_teacher_linked_to_subject,
+    resolve_subject_teachers,
+    subject_teacher_payload,
+)
 
 
 router = APIRouter(
@@ -81,6 +87,66 @@ def _subject_from_path(db: Session, subject_code: str | int) -> Subject:
     if subject is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     return subject
+
+
+def _subject_out(subject: Subject) -> dict:
+    return {
+        "id": subject.id,
+        "title": subject.title,
+        "code": subject.code,
+        "subject_code": subject.code,
+        "grade_type": subject.grade_type,
+        **subject_teacher_payload(subject),
+    }
+
+
+def _set_subject_teachers(
+    db: Session, subject: Subject, teacher_ids: list[int]
+) -> None:
+    teachers = resolve_subject_teachers(db, teacher_ids)
+    removed_ids = {teacher.id for teacher in subject.teachers} - {
+        teacher.id for teacher in teachers
+    }
+    subject.teachers = teachers
+    subject.primary_teacher = teachers[0]
+    if removed_ids and subject.id is not None:
+        db.execute(
+            update(JournalAssignment)
+            .where(
+                JournalAssignment.subject_id == subject.id,
+                JournalAssignment.teacher_id.in_(removed_ids),
+                JournalAssignment.is_active.is_(True),
+            )
+            .values(is_active=False)
+        )
+
+
+def _replace_teacher_subjects(
+    teacher: Teacher, subjects: list[Subject]
+) -> None:
+    target_ids = {subject.id for subject in subjects}
+    removed = [subject for subject in teacher.subjects if subject.id not in target_ids]
+    orphaned = [subject.code or str(subject.id) for subject in removed if len(subject.teachers) == 1]
+    if orphaned:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "A subject must have at least one teacher",
+                "subjects": orphaned,
+            },
+        )
+
+    teacher.subjects = subjects
+    for subject in removed:
+        if subject.primary_teacher_id == teacher.id:
+            remaining = sorted(
+                (item for item in subject.teachers if item.id != teacher.id),
+                key=lambda item: item.id,
+            )
+            subject.primary_teacher = remaining[0]
+    for subject in subjects:
+        if subject.primary_teacher_id is None:
+            subject.primary_teacher = teacher
 
 @router.get("/users", dependencies=[Depends(require_permission("users:read"))])
 def admin_list_users(
@@ -225,6 +291,8 @@ def admin_list_users(
                 "phoneNumber": u.phone,
                 "studyId": s.record_book,
                 "group": g.code if g else None,
+                "groupId": g.id if g else None,
+                "groupIdentifier": g.identifier if g else None,
                 "insertYear": s.insert_year,
                 "subject": None,
             }
@@ -515,24 +583,33 @@ def admin_delete_student(student_id: int, db: Session = Depends(get_db)):
 
 @router.post("/groups", dependencies=[Depends(require_permission("schedules:create"))])
 def admin_create_group(payload: GroupCreateIn, db: Session = Depends(get_db)):
-    if db.scalar(select(Group).where(Group.code == payload.code)):
-        raise HTTPException(status_code=400, detail="Group already exists")
-    g = Group(code=payload.code, title=payload.title)
+    if db.scalar(select(Group.id).where(Group.identifier == payload.identifier)):
+        raise HTTPException(status_code=400, detail="Group identifier already exists")
+    g = Group(identifier=payload.identifier, code=payload.code, title=payload.title)
     db.add(g); db.commit()
-    return {"id": g.id, "code": g.code}
+    return {"id": g.id, "identifier": g.identifier, "code": g.code, "title": g.title}
 
 @router.post("/groups/{group_id}/patch", dependencies=[Depends(require_permission("schedules:update"))])
 def admin_update_group(group_id: int, payload: GroupCreateIn, db: Session = Depends(get_db)):
     g = db.get(Group, group_id)
     if not g:
         raise HTTPException(status_code=404, detail="Group not found")
+    duplicate = db.scalar(
+        select(Group.id).where(
+            Group.identifier == payload.identifier,
+            Group.id != group_id,
+        )
+    )
+    if duplicate is not None:
+        raise HTTPException(status_code=400, detail="Group identifier already exists")
+    g.identifier = payload.identifier
     if payload.code is not None:
         g.code = payload.code
     if payload.title is not None:
         g.title = payload.title
     db.commit()
     db.refresh(g)
-    return {"id": g.id, "code": g.code, "title": g.title}
+    return {"id": g.id, "identifier": g.identifier, "code": g.code, "title": g.title}
 
 @router.post("/groups/{group_id}/delete", dependencies=[Depends(require_permission("schedules:delete"))])
 def admin_delete_group(group_id: int, db: Session = Depends(get_db)):
@@ -548,9 +625,16 @@ def admin_delete_group(group_id: int, db: Session = Depends(get_db)):
 def admin_list_groups(db: Session = Depends(get_db), q: str | None = Query(None)):
     stmt = select(Group)
     if q:
-        stmt = stmt.where(or_(Group.code.ilike(f"%{q}%"), Group.title.ilike(f"%{q}%")))
+        stmt = stmt.where(or_(
+            Group.identifier.ilike(f"%{q}%"),
+            Group.code.ilike(f"%{q}%"),
+            Group.title.ilike(f"%{q}%"),
+        ))
     rows = db.scalars(stmt).all()
-    return [{"id": g.id, "code": g.code, "title": g.title} for g in rows]
+    return [
+        {"id": g.id, "identifier": g.identifier, "code": g.code, "title": g.title}
+        for g in rows
+    ]
 
 @router.post("/teachers", dependencies=[Depends(require_permission("schedules:create"))])
 def admin_create_teacher(payload: TeacherCreateIn, db: Session = Depends(get_db)):
@@ -560,7 +644,9 @@ def admin_create_teacher(payload: TeacherCreateIn, db: Session = Depends(get_db)
     )
     db.add(t); db.flush()
     if payload.subject_codes is not None or payload.subject_ids:
-        t.subjects = _subjects_from_references(db, payload.subject_codes, payload.subject_ids)
+        _replace_teacher_subjects(
+            t, _subjects_from_references(db, payload.subject_codes, payload.subject_ids)
+        )
     db.commit()
     return {
         "id": t.id,
@@ -571,11 +657,36 @@ def admin_create_teacher(payload: TeacherCreateIn, db: Session = Depends(get_db)
 
 @router.post("/teachers/{teacher_id}/delete", dependencies=[Depends(require_permission("users:delete"))])
 def admin_delete_teacher(teacher_id: int, db: Session = Depends(get_db)):
-    t = db.get(Teacher, teacher_id)
+    t = db.scalar(
+        select(Teacher)
+        .options(selectinload(Teacher.subjects).selectinload(Subject.teachers))
+        .where(Teacher.id == teacher_id)
+    )
     if not t:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    db.delete(t)
-    db.commit()
+    orphaned = [subject.code or str(subject.id) for subject in t.subjects if len(subject.teachers) == 1]
+    if orphaned:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Teacher is the only teacher of a subject",
+                "subjects": orphaned,
+            },
+        )
+    for subject in t.subjects:
+        if subject.primary_teacher_id == t.id:
+            subject.primary_teacher = next(
+                item for item in subject.teachers if item.id != t.id
+            )
+    try:
+        db.delete(t)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Teacher is used by journal or other protected records",
+        ) from exc
     return {"ok": True}
 
 
@@ -584,7 +695,9 @@ def admin_set_teacher_subjects(teacher_id: int, payload: TeacherSubjectsIn, db: 
     t = db.get(Teacher, teacher_id)
     if not t:
         raise HTTPException(status_code=404, detail="Teacher not found")
-    t.subjects = _subjects_from_references(db, payload.subject_codes, payload.subject_ids)
+    _replace_teacher_subjects(
+        t, _subjects_from_references(db, payload.subject_codes, payload.subject_ids)
+    )
     db.commit()
     return {
         "teacher_id": t.id,
@@ -604,7 +717,9 @@ def admin_update_teacher(teacher_id: int, payload: AdminTeacherUpdate, db: Sessi
     if payload.subject is not None: t.subject = payload.subject
     if payload.subdivision_id is not None: t.subdivision_id = payload.subdivision_id
     if payload.subject_codes is not None or payload.subject_ids is not None:
-        t.subjects = _subjects_from_references(db, payload.subject_codes, payload.subject_ids)
+        _replace_teacher_subjects(
+            t, _subjects_from_references(db, payload.subject_codes, payload.subject_ids)
+        )
 
     db.commit(); db.refresh(t)
     return {
@@ -703,6 +818,9 @@ def admin_update_lesson(lesson_id: int, payload: LessonUpdate, db: Session = Dep
     if payload.notes is not None:
         l.notes = payload.notes
 
+    if l.teacher_id is not None and l.subject_id is not None:
+        ensure_teacher_linked_to_subject(db, l.teacher_id, l.subject_id)
+
     db.commit()
     db.refresh(l)
 
@@ -775,25 +893,23 @@ def admin_list_rooms(db: Session = Depends(get_db), q: str | None = Query(None))
 def admin_create_subject(payload: SubjectCreateIn, db: Session = Depends(get_db)):
     if db.scalar(select(Subject.id).where(Subject.code == payload.subject_code)):
         raise HTTPException(status_code=400, detail="Subject already exists")
-    teacher = db.get(Teacher, payload.teacher_id)
-    if not teacher:
-        raise HTTPException(status_code=404, detail="Teacher not found")
+    teachers = resolve_subject_teachers(db, payload.teacher_ids)
     s = Subject(
         title=payload.title,
         code=payload.subject_code,
-        primary_teacher_id=teacher.id,
+        primary_teacher_id=teachers[0].id,
         grade_type=payload.grade_type,
     )
     try:
         db.add(s)
         db.flush()
-        if s not in teacher.subjects:
-            teacher.subjects.append(s)
+        s.teachers = teachers
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail="Subject already exists") from exc
-    return {"id": s.id, "title": s.title, "code": s.code, "subject_code": s.code, "primary_teacher_id": s.primary_teacher_id, "grade_type": s.grade_type}
+    db.refresh(s)
+    return _subject_out(s)
 
 @router.post("/subjects/{subject_code}/patch", dependencies=[Depends(require_permission("schedules:update"))])
 def admin_update_subject(subject_code: str, payload: SubjectCreateIn, db: Session = Depends(get_db)):
@@ -810,11 +926,7 @@ def admin_update_subject(subject_code: str, payload: SubjectCreateIn, db: Sessio
         s.code = payload.subject_code
     if payload.grade_type is not None:
         s.grade_type = payload.grade_type
-    if payload.teacher_id is not None:
-        t = db.get(Teacher, payload.teacher_id)
-        if not t:
-            raise HTTPException(status_code=404, detail="Teacher not found")
-        s.primary_teacher_id = t.id
+    _set_subject_teachers(db, s, payload.teacher_ids)
 
     try:
         db.commit()
@@ -822,14 +934,7 @@ def admin_update_subject(subject_code: str, payload: SubjectCreateIn, db: Sessio
         db.rollback()
         raise HTTPException(status_code=400, detail="Subject already exists") from exc
     db.refresh(s)
-    return {
-        "id": s.id,
-        "title": s.title,
-        "code": s.code,
-        "subject_code": s.code,
-        "grade_type": s.grade_type,
-        "primary_teacher_id": s.primary_teacher_id,
-    }
+    return _subject_out(s)
 
 @router.post("/subjects/{subject_code}/delete", dependencies=[Depends(require_permission("schedules:delete"))])
 def admin_delete_subject(subject_code: str, db: Session = Depends(get_db)):
@@ -842,7 +947,9 @@ def admin_delete_subject(subject_code: str, db: Session = Depends(get_db)):
 @router.get("/subjects", dependencies=[Depends(require_permission("schedules:read"))])
 def admin_list_subjects(db: Session = Depends(get_db), q: str | None = Query(None)):
     try:
-        stmt = select(Subject)
+        stmt = select(Subject).options(
+            selectinload(Subject.teachers), selectinload(Subject.primary_teacher)
+        )
         if q:
             stmt = stmt.where(
                 or_(
@@ -854,26 +961,7 @@ def admin_list_subjects(db: Session = Depends(get_db), q: str | None = Query(Non
         stmt = stmt.order_by(Subject.id.asc())
 
         rows = db.scalars(stmt).all()
-        t_ids = [s.primary_teacher_id for s in rows if s.primary_teacher_id]
-        teachers = {}
-        if t_ids:
-            trows = db.execute(
-                select(Teacher.id, Teacher.full_name).where(Teacher.id.in_(t_ids))
-            ).all()
-            teachers = {tid: name for tid, name in trows}
-
-        return [
-            {
-                "id": s.id,
-                "title": s.title,
-                "code": s.code,
-                "subject_code": s.code,
-                "grade_type": s.grade_type,
-                "primary_teacher_id": s.primary_teacher_id,
-                "primary_teacher_name": teachers.get(s.primary_teacher_id),
-            }
-            for s in rows
-        ]
+        return [_subject_out(s) for s in rows]
     except (OperationalError, ProgrammingError):
         db.rollback()
         # Compatibility fallback while a client database is waiting for the migration.
@@ -898,6 +986,16 @@ def admin_list_subjects(db: Session = Depends(get_db), q: str | None = Query(Non
                 "grade_type": None,
                 "primary_teacher_id": row["primary_teacher_id"],
                 "primary_teacher_name": row["primary_teacher_name"],
+                "teacher_ids": (
+                    [row["primary_teacher_id"]] if row["primary_teacher_id"] else []
+                ),
+                "teachers": (
+                    [{
+                        "id": row["primary_teacher_id"],
+                        "full_name": row["primary_teacher_name"],
+                    }]
+                    if row["primary_teacher_id"] else []
+                ),
             }
             for row in rows
         ]

@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy import select, or_, distinct
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, ProgrammingError
@@ -12,13 +12,19 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from app.core.deps import get_db, get_current_user, require_permission, is_admin
-from app.models.schedule import Lesson, Group, Teacher, Subject, Room, lesson_teachers
+from app.models.schedule import (
+    Lesson, Group, Teacher, Subject, Room, LessonTime, lesson_teachers, teacher_subjects,
+)
 from app.models.grade import Student as StudentModel, Grade
 from app.models.user import User
-from app.schemas.schedule import LessonCreate, LessonOut
+from app.schemas.schedule import LessonCreate, LessonOut, SubjectType
 from app.models.role import Role, user_roles
 from app.schemas.schedule import LessonTopicUpdate, LessonUpdate
 from app.services.subject_service import resolve_subject
+from app.services.subject_teacher_service import (
+    ensure_teacher_linked_to_subject,
+    subject_teacher_payload,
+)
 
 router = APIRouter(prefix="/schedules", tags=["schedules"])
 
@@ -66,13 +72,29 @@ def create_lesson(payload: LessonCreate, db: Session = Depends(get_db), me=Depen
             {"email": payload.teacher_email, "phone": payload.teacher_phone, "subject": payload.teacher_subject}
         )
 
-    if subject.primary_teacher_id and subject.primary_teacher_id != teacher.id:
-        raise HTTPException(status_code=400, detail="Lesson teacher must match subject's primary teacher")
+    ensure_teacher_linked_to_subject(db, teacher.id, subject.id)
 
     room = get_or_create(db, Room, {"code": payload.room_code}, {"title": payload.room_code})
 
+    if payload.lesson_number is not None:
+        lesson_time = db.scalar(
+            select(LessonTime).where(LessonTime.lesson_number == payload.lesson_number)
+        )
+    else:
+        lesson_time = db.scalar(
+            select(LessonTime)
+            .where(
+                LessonTime.start_time <= payload.starts_at.time(),
+                LessonTime.end_time >= payload.starts_at.time(),
+            )
+            .order_by(LessonTime.lesson_number)
+        )
+    if lesson_time is None:
+        raise HTTPException(status_code=422, detail="LessonTime not found")
+
     lesson = Lesson(
         group_id=group.id, subject_id=subject.id, teacher_id=teacher.id, room_id=room.id,
+        lesson_number=lesson_time.lesson_number,
         starts_at=payload.starts_at, ends_at=payload.ends_at,
         subject_type=payload.subject_type, topic=payload.topic, notes=payload.notes, created_by=me.id
     )
@@ -119,9 +141,11 @@ def update_lesson(
 
     if teacher:
         subject = db.get(Subject, lesson.subject_id)
-        if subject and subject.primary_teacher_id and subject.primary_teacher_id != teacher.id:
-            raise HTTPException(status_code=400, detail="Lesson teacher must match subject's primary teacher")
+        if subject:
+            ensure_teacher_linked_to_subject(db, teacher.id, subject.id)
         lesson.teacher_id = teacher.id
+    elif lesson.teacher_id is not None and lesson.subject_id is not None:
+        ensure_teacher_linked_to_subject(db, lesson.teacher_id, lesson.subject_id)
 
     if payload.room_code:
         room = get_or_create(db, Room, {"code": payload.room_code}, {"title": payload.room_code})
@@ -160,23 +184,31 @@ def teacher_teaching_overview(
         raise HTTPException(status_code=404, detail="Teacher not found")
 
     groups_stmt = (
-        select(distinct(Group.id), Group.code, Group.title)
+        select(distinct(Group.id), Group.identifier, Group.code, Group.title)
         .join(Lesson, Lesson.group_id == Group.id)
-        .where(Lesson.teacher_id == teacher_id)
+        .join(teacher_subjects, teacher_subjects.c.subject_id == Lesson.subject_id)
+        .where(teacher_subjects.c.teacher_id == teacher_id)
     )
     if date_from:
         groups_stmt = groups_stmt.where(Lesson.starts_at >= date_from)
     if date_to:
         groups_stmt = groups_stmt.where(Lesson.starts_at < date_to)
     groups_rows = db.execute(groups_stmt).all()
-    groups = [{"id": gid, "code": gcode, "title": gtitle} for gid, gcode, gtitle in groups_rows]
+    groups = [
+        {"id": gid, "identifier": identifier, "code": gcode, "title": gtitle}
+        for gid, identifier, gcode, gtitle in groups_rows
+    ]
     group_ids = [g["id"] for g in groups] or [-1]
 
     subj_stmt = (
         select(distinct(Group.id), Subject.id, Subject.title, Subject.code, Subject.grade_type)
         .join(Lesson, Lesson.group_id == Group.id)
         .join(Subject, Subject.id == Lesson.subject_id)
-        .where(Lesson.teacher_id == teacher_id, Lesson.group_id.in_(group_ids))
+        .join(teacher_subjects, teacher_subjects.c.subject_id == Subject.id)
+        .where(
+            teacher_subjects.c.teacher_id == teacher_id,
+            Lesson.group_id.in_(group_ids),
+        )
     )
     if date_from:
         subj_stmt = subj_stmt.where(Lesson.starts_at >= date_from)
@@ -295,7 +327,7 @@ def list_lessons(
     subject_code: str | None = Query(None, description="Код дисциплины"),
     subject_title: str | None = Query(None, description="Название предмета (подстрочный поиск)"),
     room_code: str | None = Query(None, description="Код аудитории"),
-    subject_type: str | None = Query(None, description="lecture/practice/lab"),
+    subject_type: SubjectType | None = Query(None, description="lecture/practice/lab"),
 ):
     try:
         q = (
@@ -429,7 +461,7 @@ def export_schedule(
     subject_code: str | None = Query(None, description="Код дисциплины"),
     subject_title: str | None = Query(None, description="Название предмета (подстрочный поиск)"),
     room_code: str | None = Query(None, description="Код аудитории"),
-    subject_type: str | None = Query(None, description="lecture/practice/lab"),
+    subject_type: SubjectType | None = Query(None, description="lecture/practice/lab"),
 ):
     """Выгрузить отфильтрованное расписание в подготовленный для печати Excel-файл."""
     lessons = list_lessons(
@@ -629,9 +661,16 @@ def update_lesson_topic(
 def lookup_groups(db: Session = Depends(get_db), q: str | None = Query(None)):
     stmt = select(Group)
     if q:
-        stmt = stmt.where(or_(Group.code.ilike(f"%{q}%"), Group.title.ilike(f"%{q}%")))
+        stmt = stmt.where(or_(
+            Group.identifier.ilike(f"%{q}%"),
+            Group.code.ilike(f"%{q}%"),
+            Group.title.ilike(f"%{q}%"),
+        ))
     rows = db.scalars(stmt).all()
-    return [{"id": g.id, "code": g.code, "title": g.title} for g in rows]
+    return [
+        {"id": g.id, "identifier": g.identifier, "code": g.code, "title": g.title}
+        for g in rows
+    ]
 
 @router.get("/lookup/teachers")
 def lookup_teachers(db: Session = Depends(get_db), q: str | None = Query(None), subdivision_id: int | None = Query(None)):
@@ -742,12 +781,21 @@ def lookup_rooms(db: Session = Depends(get_db), q: str | None = Query(None)):
 
 @router.get("/lookup/subjects")
 def lookup_subjects(db: Session = Depends(get_db), q: str | None = Query(None)):
-    stmt = select(Subject)
+    stmt = select(Subject).options(
+        selectinload(Subject.teachers), selectinload(Subject.primary_teacher)
+    )
     if q:
         stmt = stmt.where(or_(Subject.title.ilike(f"%{q}%"), Subject.code.ilike(f"%{q}%")))
     rows = db.scalars(stmt).all()
     return [
-        {"id": s.id, "title": s.title, "code": s.code, "subject_code": s.code}
+        {
+            "id": s.id,
+            "title": s.title,
+            "code": s.code,
+            "subject_code": s.code,
+            "grade_type": s.grade_type,
+            **subject_teacher_payload(s),
+        }
         for s in rows
     ]
 

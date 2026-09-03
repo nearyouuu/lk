@@ -31,6 +31,12 @@ ATTENDANCE_FILLS = {
     "excused": "DDEBF7",
 }
 
+LESSON_TYPE_LABELS = {
+    "lecture": "Лекция",
+    "practice": "Практическое занятие",
+    "lab": "Лабораторная работа",
+}
+
 
 def _grade_fill(value: str | None) -> str | None:
     return {
@@ -245,10 +251,11 @@ def build_journal_workbook(
         ("№", 6),
         ("Дата", 14),
         ("Часы", 10),
+        ("Тип", 24),
         ("Тема", 55),
         ("Комментарий", 40),
     )
-    topics_sheet.merge_cells("A1:E1")
+    topics_sheet.merge_cells("A1:F1")
     topics_title = topics_sheet["A1"]
     topics_title.value = f"Даты и темы · {group.code} · {subject_label}"
     topics_title.font = Font(name="Arial", size=14, bold=True, color="FFFFFF")
@@ -266,6 +273,7 @@ def build_journal_workbook(
             row_number - 3,
             lesson.lesson_date,
             lesson.hours,
+            LESSON_TYPE_LABELS.get(lesson.lesson_type, lesson.lesson_type),
             lesson.topic_text or "",
             lesson.comment or "",
         )
@@ -273,7 +281,7 @@ def build_journal_workbook(
             cell = topics_sheet.cell(row_number, column_number, value)
             cell.font = Font(name="Arial", size=9)
             cell.alignment = Alignment(
-                horizontal="left" if column_number in {4, 5} else "center",
+                horizontal="left" if column_number in {5, 6} else "center",
                 vertical="center",
                 wrap_text=True,
             )
@@ -281,7 +289,7 @@ def build_journal_workbook(
         topics_sheet.cell(row_number, 2).number_format = "dd.mm.yyyy"
         topics_sheet.row_dimensions[row_number].height = 30
     topics_sheet.freeze_panes = "A4"
-    topics_sheet.auto_filter.ref = f"A3:E{max(3, topics_sheet.max_row)}"
+    topics_sheet.auto_filter.ref = f"A3:F{max(3, topics_sheet.max_row)}"
     topics_sheet.print_title_rows = "1:3"
     topics_sheet.page_setup.orientation = "landscape"
     topics_sheet.page_setup.fitToWidth = 1

@@ -74,10 +74,10 @@ class UserImporterTests(unittest.TestCase):
     def test_imports_groups_students_and_teachers(self):
         path = self._workbook(
             [
-                {"ФИО": "Студент Тест", "Электронная почта": "student@test.kz", "Роль": "студент", "Группа": "ИС-24", "Номер зачётки": "001", "Курс": 2},
+                {"ФИО": "Студент Тест", "Электронная почта": "student@test.kz", "Роль": "студент", "Идентификатор группы": "G-001", "Номер зачётки": "001", "Курс": 2},
                 {"ФИО": "Учитель Тест", "Электронная почта": "teacher@test.kz", "Роль": "преподаватель", "Предмет": "Математика"},
             ],
-            [{"Код группы": "ИС-24", "Название группы": "Информационные системы"}],
+            [{"Идентификатор группы": "G-001", "Код группы": "ИС-24", "Название группы": "Информационные системы"}],
         )
 
         result = import_users_from_excel(self.db, path, self.temp_dir.name)
@@ -106,6 +106,26 @@ class UserImporterTests(unittest.TestCase):
         self.assertEqual(self.db.scalar(select(func.count(User.id))), 1)
         report = pd.read_excel(result.report_path, sheet_name="Пользователи")
         self.assertEqual(report["Статус"].tolist(), ["Ошибка", "Создан", "Ошибка"])
+
+    def test_group_identifier_allows_duplicate_code_and_title(self):
+        path = self._workbook(
+            [
+                {"ФИО": "Первый студент", "Электронная почта": "first@test.kz", "Роль": "студент", "Идентификатор группы": "G-101"},
+                {"ФИО": "Второй студент", "Электронная почта": "second@test.kz", "Роль": "студент", "Идентификатор группы": "G-102"},
+            ],
+            [
+                {"Идентификатор группы": "G-101", "Код группы": "ИС-24", "Название группы": "Информационные системы"},
+                {"Идентификатор группы": "G-102", "Код группы": "ИС-24", "Название группы": "Информационные системы"},
+            ],
+        )
+
+        result = import_users_from_excel(self.db, path, self.temp_dir.name)
+
+        groups = self.db.scalars(select(Group).order_by(Group.identifier)).all()
+        students = self.db.scalars(select(Student).order_by(Student.id)).all()
+        self.assertEqual(result.groups_created, 2)
+        self.assertEqual([group.identifier for group in groups], ["G-101", "G-102"])
+        self.assertEqual([student.group_id for student in students], [groups[0].id, groups[1].id])
 
     def test_imports_teacher_with_long_subject_list(self):
         subject = "; ".join(f"Дисциплина {index}" for index in range(40))
