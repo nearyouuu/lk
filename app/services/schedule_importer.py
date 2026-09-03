@@ -27,7 +27,7 @@ def get_or_create(db: Session, model, defaults=None, **kwargs):
 def detect_subject_type(subject_title: str) -> str | None:
     t = subject_title.lower()
     if "лаб" in t:
-        return "lab"
+        return "educational_practice"
     if "практика" in t or "практич" in t:
         return "practice"
     if "лекция" in t:

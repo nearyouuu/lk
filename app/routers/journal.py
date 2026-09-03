@@ -93,6 +93,17 @@ def _lesson_out(lesson: JournalLesson) -> dict:
     }
 
 
+def _journal_days(lessons: list[JournalLesson]) -> list[dict]:
+    days_by_date: dict[str, dict] = {}
+    for lesson in lessons:
+        date_key = lesson.lesson_date.isoformat()
+        day = days_by_date.setdefault(date_key, {"date": date_key, "lessons": []})
+        lesson_payload = _lesson_out(lesson)
+        lesson_payload.pop("date", None)
+        day["lessons"].append(lesson_payload)
+    return list(days_by_date.values())
+
+
 def _entry_out(entry: JournalEntry) -> dict:
     return {
         "id": entry.id,
@@ -109,10 +120,43 @@ def _request_id(request_id: str | None) -> str | None:
     return request_id[:100] if request_id else None
 
 
+def _lesson_create_conflict(
+    db: Session,
+    me: User,
+    idempotency_key: str | None,
+    schedule_lesson_id: int | None,
+) -> dict:
+    if idempotency_key:
+        existing = db.scalar(
+            select(JournalLesson)
+            .options(joinedload(JournalLesson.topic), joinedload(JournalLesson.period))
+            .where(JournalLesson.idempotency_key == idempotency_key)
+        )
+        if existing:
+            ensure_lesson_access(db, me, existing)
+            return _lesson_out(existing)
+    if schedule_lesson_id is not None:
+        linked_lesson_id = db.scalar(
+            select(JournalLesson.id).where(
+                JournalLesson.schedule_lesson_id == schedule_lesson_id
+            )
+        )
+        if linked_lesson_id:
+            error(
+                409,
+                "JOURNAL_LESSON_DUPLICATE",
+                "Занятие расписания уже добавлено в журнал",
+                {"journal_lesson_id": linked_lesson_id},
+            )
+    error(409, "JOURNAL_LESSON_CONFLICT", "Не удалось создать занятие")
+
+
 def _student_viewer(db: Session, user: User) -> Student | None:
     if is_privileged(db, user) or get_teacher(db, user, required=False) is not None:
         return None
-    return get_student(db, user, required=False)
+    if get_student(db, user, required=False) is not None:
+        error(403, "JOURNAL_ACCESS_DENIED", "Студентам учебный журнал недоступен")
+    return None
 
 
 @router.get("/catalog")
@@ -287,7 +331,12 @@ def export_journal_excel(
             JournalLesson.lesson_date >= date_from,
             JournalLesson.lesson_date <= date_to,
         )
-        .order_by(JournalLesson.lesson_date, JournalLesson.starts_at, JournalLesson.id)
+        .order_by(
+            JournalLesson.lesson_date,
+            JournalLesson.starts_at.is_(None),
+            JournalLesson.starts_at,
+            JournalLesson.id,
+        )
     )
     if student_viewer is not None:
         lesson_query = lesson_query.where(JournalLesson.status == "published")
@@ -434,7 +483,7 @@ def get_journal(
             **subject_teacher_payload(subject),
         },
         "students": [_student_out(row) for row in students],
-        "lessons": [_lesson_out(row) for row in lessons],
+        "days": _journal_days(lessons),
         "entries": [_entry_out(row) for row in entries],
         "permissions": {
             "can_edit": student_viewer is None and not period.is_locked,
@@ -457,6 +506,12 @@ def create_journal_lesson(
     me: User = Depends(get_current_user),
 ):
     ensure_permission(db, me, "journal.lesson.write")
+    if idempotency_key and len(idempotency_key) > 255:
+        error(
+            400,
+            "JOURNAL_INVALID_IDEMPOTENCY_KEY",
+            "Idempotency-Key не должен превышать 255 символов",
+        )
     if idempotency_key:
         existing = db.scalar(
             select(JournalLesson)
@@ -545,13 +600,17 @@ def create_journal_lesson(
         if linked_lesson_id:
             error(
                 409,
-                "JOURNAL_SCHEDULE_LESSON_ALREADY_IMPORTED",
+                "JOURNAL_LESSON_DUPLICATE",
                 "Занятие расписания уже добавлено в журнал",
                 {"journal_lesson_id": linked_lesson_id},
             )
         if schedule_lesson.subject_type is None:
             lesson_type = "practice"
-        elif schedule_lesson.subject_type in {"lecture", "practice", "lab"}:
+        elif schedule_lesson.subject_type in {
+            "lecture",
+            "practice",
+            "educational_practice",
+        }:
             lesson_type = schedule_lesson.subject_type
         else:
             error(
@@ -576,17 +635,6 @@ def create_journal_lesson(
             error(422, "JOURNAL_TOPIC_SUBJECT_MISMATCH", "Тема не принадлежит дисциплине")
     topic_text = payload.topic_text or (topic.title if topic else "")
 
-    duplicate_query = select(JournalLesson.id).where(
-        JournalLesson.group_id == payload.group_id,
-        JournalLesson.subject_id == payload.subject_id,
-        JournalLesson.lesson_date == payload.date,
-        JournalLesson.starts_at.is_(None)
-        if payload.starts_at is None
-        else JournalLesson.starts_at == payload.starts_at,
-    )
-    if db.scalar(duplicate_query):
-        error(409, "JOURNAL_LESSON_DUPLICATE", "Занятие в это время уже существует")
-
     lesson = JournalLesson(
         group_id=payload.group_id,
         subject_id=payload.subject_id,
@@ -607,7 +655,13 @@ def create_journal_lesson(
         updated_by=me.id,
     )
     db.add(lesson)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return _lesson_create_conflict(
+            db, me, idempotency_key, payload.schedule_lesson_id
+        )
 
     students = db.scalars(
         select(Student).options(joinedload(Student.user)).where(Student.group_id == group.id)
@@ -634,9 +688,11 @@ def create_journal_lesson(
     )
     try:
         db.commit()
-    except IntegrityError as exc:
+    except IntegrityError:
         db.rollback()
-        error(409, "JOURNAL_LESSON_DUPLICATE", "Занятие уже существует")
+        return _lesson_create_conflict(
+            db, me, idempotency_key, payload.schedule_lesson_id
+        )
     db.refresh(lesson)
     if topic:
         lesson.topic = topic
@@ -712,6 +768,8 @@ def patch_journal_lesson(
                 lesson.topic_text = topic.title
     if "topic_text" in changes:
         lesson.topic_text = payload.topic_text or ""
+    if not lesson.topic_text.strip():
+        error(422, "JOURNAL_TOPIC_REQUIRED", "Укажите тему занятия")
 
     lesson.version += 1
     lesson.updated_by = me.id
@@ -733,7 +791,7 @@ def patch_journal_lesson(
         error(409, "JOURNAL_VERSION_CONFLICT", "Занятие уже изменено")
     except IntegrityError:
         db.rollback()
-        error(409, "JOURNAL_LESSON_DUPLICATE", "Занятие в это время уже существует")
+        error(409, "JOURNAL_LESSON_CONFLICT", "Не удалось изменить занятие")
     db.refresh(lesson)
     return _lesson_out(lesson)
 

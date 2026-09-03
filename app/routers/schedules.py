@@ -32,7 +32,7 @@ SCHEDULE_EXPORT_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spre
 SUBJECT_TYPE_LABELS = {
     "lecture": "Лекция",
     "practice": "Практика",
-    "lab": "Лабораторная",
+    "educational_practice": "Учебная практика",
 }
 
 def get_or_create(db, model, where: dict, defaults: dict = {}):
@@ -56,8 +56,13 @@ def user_has_role(db: Session, user_id: int, role_name: str) -> bool:
 def create_lesson(payload: LessonCreate, db: Session = Depends(get_db), me=Depends(get_current_user)):
     group = get_or_create(db, Group, {"code": payload.group_code}, {"title": payload.group_code})
 
-    if payload.subject_code or payload.subject_id is not None:
-        subject = resolve_subject(db, payload.subject_code, payload.subject_id)
+    if payload.subject_identifier or payload.subject_code or payload.subject_id is not None:
+        subject = resolve_subject(
+            db,
+            payload.subject_code,
+            payload.subject_id,
+            subject_identifier=payload.subject_identifier,
+        )
     else:
         subject = get_or_create(db, Subject, {"title": payload.subject_title})
 
@@ -99,7 +104,11 @@ def create_lesson(payload: LessonCreate, db: Session = Depends(get_db), me=Depen
         subject_type=payload.subject_type, topic=payload.topic, notes=payload.notes, created_by=me.id
     )
     db.add(lesson); db.commit()
-    return {"id": lesson.id, "subject_code": subject.code}
+    return {
+        "id": lesson.id,
+        "subject_identifier": subject.identifier,
+        "subject_code": subject.code,
+    }
 
 @router.post(
     "/lessons/{lesson_id}",
@@ -119,8 +128,13 @@ def update_lesson(
         group = get_or_create(db, Group, {"code": payload.group_code}, {"title": payload.group_code})
         lesson.group_id = group.id
 
-    if payload.subject_code or payload.subject_id is not None:
-        subject = resolve_subject(db, payload.subject_code, payload.subject_id)
+    if payload.subject_identifier or payload.subject_code or payload.subject_id is not None:
+        subject = resolve_subject(
+            db,
+            payload.subject_code,
+            payload.subject_id,
+            subject_identifier=payload.subject_identifier,
+        )
         lesson.subject_id = subject.id
     elif payload.subject_title:
         subject = get_or_create(db, Subject, {"title": payload.subject_title})
@@ -169,6 +183,7 @@ def update_lesson(
     return {
         "id": lesson.id,
         "subject_code": lesson.subject.code if lesson.subject else None,
+        "subject_identifier": lesson.subject.identifier if lesson.subject else None,
         "updated": True,
     }
 
@@ -201,7 +216,10 @@ def teacher_teaching_overview(
     group_ids = [g["id"] for g in groups] or [-1]
 
     subj_stmt = (
-        select(distinct(Group.id), Subject.id, Subject.title, Subject.code, Subject.grade_type)
+        select(
+            distinct(Group.id), Subject.id, Subject.identifier,
+            Subject.title, Subject.code, Subject.grade_type,
+        )
         .join(Lesson, Lesson.group_id == Group.id)
         .join(Subject, Subject.id == Lesson.subject_id)
         .join(teacher_subjects, teacher_subjects.c.subject_id == Subject.id)
@@ -216,8 +234,15 @@ def teacher_teaching_overview(
         subj_stmt = subj_stmt.where(Lesson.starts_at < date_to)
     subj_rows = db.execute(subj_stmt).all()
     subjects_by_group = {}
-    for gid, sid, stitle, scode, grade_type in subj_rows:
-        subjects_by_group.setdefault(gid, []).append({"id": sid, "title": stitle, "code": scode, "subject_code": scode, "grade_type": grade_type})
+    for gid, sid, identifier, stitle, scode, grade_type in subj_rows:
+        subjects_by_group.setdefault(gid, []).append({
+            "id": sid,
+            "identifier": identifier,
+            "title": stitle,
+            "code": scode,
+            "subject_code": scode,
+            "grade_type": grade_type,
+        })
 
     lesson_stmt = (
         select(Lesson)
@@ -283,6 +308,7 @@ def teacher_teaching_overview(
                 "group_id": l.group_id,
                 "group_code": l.group.code if l.group else None,
                 "subject_id": l.subject_id,
+                "subject_identifier": l.subject.identifier if l.subject else None,
                 "subject_code": l.subject.code if l.subject else None,
                 "subject_title": l.subject.title if l.subject else None,
                 "room": l.room.code if l.room else None,
@@ -327,7 +353,9 @@ def list_lessons(
     subject_code: str | None = Query(None, description="Код дисциплины"),
     subject_title: str | None = Query(None, description="Название предмета (подстрочный поиск)"),
     room_code: str | None = Query(None, description="Код аудитории"),
-    subject_type: SubjectType | None = Query(None, description="lecture/practice/lab"),
+    subject_type: SubjectType | None = Query(
+        None, description="lecture/practice/educational_practice"
+    ),
 ):
     try:
         q = (
@@ -461,7 +489,9 @@ def export_schedule(
     subject_code: str | None = Query(None, description="Код дисциплины"),
     subject_title: str | None = Query(None, description="Название предмета (подстрочный поиск)"),
     room_code: str | None = Query(None, description="Код аудитории"),
-    subject_type: SubjectType | None = Query(None, description="lecture/practice/lab"),
+    subject_type: SubjectType | None = Query(
+        None, description="lecture/practice/educational_practice"
+    ),
 ):
     """Выгрузить отфильтрованное расписание в подготовленный для печати Excel-файл."""
     lessons = list_lessons(
@@ -764,6 +794,7 @@ def get_students_for_lesson(
         "group_id": lesson.group_id,
         "group_code": lesson.group.code if lesson.group else None,
         "subject_id": lesson.subject_id,
+        "subject_identifier": lesson.subject.identifier if lesson.subject else None,
         "subject_code": lesson.subject.code if lesson.subject else None,
         "subject_title": lesson.subject.title if lesson.subject else None,
         "grade_type": lesson.subject.grade_type if lesson.subject else None,
@@ -785,11 +816,16 @@ def lookup_subjects(db: Session = Depends(get_db), q: str | None = Query(None)):
         selectinload(Subject.teachers), selectinload(Subject.primary_teacher)
     )
     if q:
-        stmt = stmt.where(or_(Subject.title.ilike(f"%{q}%"), Subject.code.ilike(f"%{q}%")))
+        stmt = stmt.where(or_(
+            Subject.identifier.ilike(f"%{q}%"),
+            Subject.title.ilike(f"%{q}%"),
+            Subject.code.ilike(f"%{q}%"),
+        ))
     rows = db.scalars(stmt).all()
     return [
         {
             "id": s.id,
+            "identifier": s.identifier,
             "title": s.title,
             "code": s.code,
             "subject_code": s.code,

@@ -17,6 +17,7 @@ class SubjectTypeOut(SubjectTypeBase):
 
 
 class SubjectBase(BaseModel):
+    identifier: str
     title: str
     code: Optional[str] = None
     grade_type: Literal["exam", "зачет"]

@@ -117,19 +117,12 @@ class JournalLesson(Base):
     __tablename__ = "journal_lessons"
     __table_args__ = (
         CheckConstraint(
-            "lesson_type IN ('lecture', 'practice', 'lab')",
+            "lesson_type IN ('lecture', 'practice', 'educational_practice')",
             name="ck_journal_lessons_type",
         ),
         CheckConstraint(
             "status IN ('draft', 'published', 'cancelled')",
             name="ck_journal_lessons_status",
-        ),
-        UniqueConstraint(
-            "group_id",
-            "subject_id",
-            "lesson_date",
-            "starts_at",
-            name="uq_journal_lesson_slot",
         ),
         Index(
             "ix_journal_lessons_group_subject_date",
@@ -158,7 +151,7 @@ class JournalLesson(Base):
     ends_at: Mapped[time | None] = mapped_column(Time, nullable=True)
     lesson_type: Mapped[str] = mapped_column(String(20), nullable=False)
     topic_id: Mapped[int | None] = mapped_column(
-        ForeignKey("subject_topics.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("subject_topics.id", ondelete="SET NULL"), nullable=True, index=True
     )
     topic_text: Mapped[str] = mapped_column(String(500), nullable=False)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)

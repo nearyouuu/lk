@@ -39,6 +39,7 @@ from app.services.subject_teacher_service import (
     resolve_subject_teachers,
     subject_teacher_payload,
 )
+from app.services.subject_service import resolve_subject
 
 
 router = APIRouter(
@@ -68,22 +69,41 @@ def _subjects_from_references(
 ) -> list[Subject]:
     if subject_codes is not None:
         normalized_codes = list(dict.fromkeys(code.strip() for code in subject_codes if code.strip()))
-        subjects = db.scalars(select(Subject).where(Subject.code.in_(normalized_codes))).all()
-        subjects_by_code = {subject.code: subject for subject in subjects}
-        if len(subjects_by_code) != len(normalized_codes):
-            raise HTTPException(status_code=404, detail="Subject not found")
-        return [subjects_by_code[code] for code in normalized_codes]
+        result: list[Subject] = []
+        for code in normalized_codes:
+            matches = db.scalars(
+                select(Subject).where(Subject.code == code).order_by(Subject.id).limit(2)
+            ).all()
+            if not matches:
+                raise HTTPException(status_code=404, detail="Subject not found")
+            if len(matches) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Subject code '{code}' is ambiguous; use subject_ids",
+                )
+            result.append(matches[0])
+        return result
     if subject_ids is not None:
         return list(db.scalars(select(Subject).where(Subject.id.in_(subject_ids))).all())
     return []
 
 
-def _subject_from_path(db: Session, subject_code: str | int) -> Subject:
-    """Resolve the canonical code, with a numeric-ID fallback for old clients."""
-    reference = str(subject_code).strip()
-    subject = db.scalar(select(Subject).where(Subject.code == reference))
+def _subject_from_path(db: Session, subject_identifier: str | int) -> Subject:
+    """Resolve the stable identifier, with ID and unambiguous code fallbacks."""
+    reference = str(subject_identifier).strip()
+    subject = db.scalar(select(Subject).where(Subject.identifier == reference))
     if subject is None and reference.isdigit():
         subject = db.get(Subject, int(reference))
+    if subject is None:
+        matches = db.scalars(
+            select(Subject).where(Subject.code == reference).order_by(Subject.id).limit(2)
+        ).all()
+        if len(matches) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Subject code is ambiguous; use subject identifier",
+            )
+        subject = matches[0] if matches else None
     if subject is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     return subject
@@ -92,6 +112,7 @@ def _subject_from_path(db: Session, subject_code: str | int) -> Subject:
 def _subject_out(subject: Subject) -> dict:
     return {
         "id": subject.id,
+        "identifier": subject.identifier,
         "title": subject.title,
         "code": subject.code,
         "subject_code": subject.code,
@@ -651,6 +672,7 @@ def admin_create_teacher(payload: TeacherCreateIn, db: Session = Depends(get_db)
     return {
         "id": t.id,
         "full_name": t.full_name,
+        "subject_identifiers": [s.identifier for s in t.subjects],
         "subject_codes": [s.code for s in t.subjects],
         "subject_ids": [s.id for s in t.subjects],
     }
@@ -701,6 +723,7 @@ def admin_set_teacher_subjects(teacher_id: int, payload: TeacherSubjectsIn, db: 
     db.commit()
     return {
         "teacher_id": t.id,
+        "subject_identifiers": [s.identifier for s in t.subjects],
         "subject_codes": [s.code for s in t.subjects],
         "subject_ids": [s.id for s in t.subjects],
     }
@@ -730,6 +753,7 @@ def admin_update_teacher(teacher_id: int, payload: AdminTeacherUpdate, db: Sessi
         "subject": t.subject,
         "subdivision_id": t.subdivision_id,
         "subject_ids": [s.id for s in t.subjects],
+        "subject_identifiers": [s.identifier for s in t.subjects],
         "subject_codes": [s.code for s in t.subjects],
     }
 
@@ -743,14 +767,26 @@ def admin_list_teachers(db: Session = Depends(get_db), q: str | None = Query(Non
     rows = db.scalars(qstmt).all()
     ids = [t.id for t in rows]
     subj_rows = db.execute(
-        select(teacher_subjects.c.teacher_id, Subject.id, Subject.title, Subject.code)
+        select(
+            teacher_subjects.c.teacher_id,
+            Subject.id,
+            Subject.identifier,
+            Subject.title,
+            Subject.code,
+        )
         .join(Subject, Subject.id == teacher_subjects.c.subject_id)
         .where(teacher_subjects.c.teacher_id.in_(ids))
     ).all()
     subj_map: dict[int, list[dict]] = {i: [] for i in ids}
-    for tid, sid, stitle, scode in subj_rows:
+    for tid, sid, identifier, stitle, scode in subj_rows:
         subj_map.setdefault(tid, []).append(
-            {"id": sid, "title": stitle, "code": scode, "subject_code": scode}
+            {
+                "id": sid,
+                "identifier": identifier,
+                "title": stitle,
+                "code": scode,
+                "subject_code": scode,
+            }
         )
 
     return [
@@ -779,18 +815,32 @@ def admin_update_lesson(lesson_id: int, payload: LessonUpdate, db: Session = Dep
             raise HTTPException(status_code=404, detail="Room not found")
         l.room_id = r.id
 
-    if payload.subject_code is not None:
-        s = db.scalar(select(Subject).where(Subject.code == payload.subject_code))
-        if not s:
-            raise HTTPException(status_code=404, detail="Subject not found")
-        l.subject_id = s.id
-    elif payload.subject_id is not None:
-        l.subject_id = payload.subject_id
+    if (
+        payload.subject_identifier is not None
+        or payload.subject_code is not None
+        or payload.subject_id is not None
+    ):
+        l.subject_id = resolve_subject(
+            db,
+            payload.subject_code,
+            payload.subject_id,
+            subject_identifier=payload.subject_identifier,
+        ).id
     elif payload.subject_title is not None:
-        s = db.scalar(select(Subject).where(Subject.title == payload.subject_title))
-        if not s:
+        matches = db.scalars(
+            select(Subject)
+            .where(Subject.title == payload.subject_title)
+            .order_by(Subject.id)
+            .limit(2)
+        ).all()
+        if not matches:
             raise HTTPException(status_code=404, detail="Subject not found")
-        l.subject_id = s.id
+        if len(matches) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Subject title is ambiguous; use subject_id or subject_identifier",
+            )
+        l.subject_id = matches[0].id
 
     if payload.teacher_id is not None:
         l.teacher_id = payload.teacher_id
@@ -828,6 +878,7 @@ def admin_update_lesson(lesson_id: int, payload: LessonUpdate, db: Session = Dep
         "id": l.id,
         "group_id": l.group_id,
         "subject_id": l.subject_id,
+        "subject_identifier": l.subject.identifier if l.subject else None,
         "subject_code": l.subject.code if l.subject else None,
         "teacher_id": l.teacher_id,
         "room_id": l.room_id,
@@ -891,8 +942,10 @@ def admin_list_rooms(db: Session = Depends(get_db), q: str | None = Query(None))
 
 @router.post("/subjects", dependencies=[Depends(require_permission("schedules:create"))])
 def admin_create_subject(payload: SubjectCreateIn, db: Session = Depends(get_db)):
-    if db.scalar(select(Subject.id).where(Subject.code == payload.subject_code)):
-        raise HTTPException(status_code=400, detail="Subject already exists")
+    if payload.identifier and db.scalar(
+        select(Subject.id).where(Subject.identifier == payload.identifier)
+    ):
+        raise HTTPException(status_code=400, detail="Subject identifier already exists")
     teachers = resolve_subject_teachers(db, payload.teacher_ids)
     s = Subject(
         title=payload.title,
@@ -900,6 +953,8 @@ def admin_create_subject(payload: SubjectCreateIn, db: Session = Depends(get_db)
         primary_teacher_id=teachers[0].id,
         grade_type=payload.grade_type,
     )
+    if payload.identifier:
+        s.identifier = payload.identifier
     try:
         db.add(s)
         db.flush()
@@ -911,15 +966,20 @@ def admin_create_subject(payload: SubjectCreateIn, db: Session = Depends(get_db)
     db.refresh(s)
     return _subject_out(s)
 
-@router.post("/subjects/{subject_code}/patch", dependencies=[Depends(require_permission("schedules:update"))])
-def admin_update_subject(subject_code: str, payload: SubjectCreateIn, db: Session = Depends(get_db)):
-    s = _subject_from_path(db, subject_code)
+@router.post("/subjects/{subject_identifier}/patch", dependencies=[Depends(require_permission("schedules:update"))])
+def admin_update_subject(subject_identifier: str, payload: SubjectCreateIn, db: Session = Depends(get_db)):
+    s = _subject_from_path(db, subject_identifier)
 
-    if db.scalar(
-        select(Subject.id).where(Subject.code == payload.subject_code, Subject.id != s.id)
+    if payload.identifier and db.scalar(
+        select(Subject.id).where(
+            Subject.identifier == payload.identifier,
+            Subject.id != s.id,
+        )
     ):
-        raise HTTPException(status_code=400, detail="Subject already exists")
+        raise HTTPException(status_code=400, detail="Subject identifier already exists")
 
+    if payload.identifier is not None:
+        s.identifier = payload.identifier
     if payload.title is not None:
         s.title = payload.title
     if payload.subject_code is not None:
@@ -936,9 +996,9 @@ def admin_update_subject(subject_code: str, payload: SubjectCreateIn, db: Sessio
     db.refresh(s)
     return _subject_out(s)
 
-@router.post("/subjects/{subject_code}/delete", dependencies=[Depends(require_permission("schedules:delete"))])
-def admin_delete_subject(subject_code: str, db: Session = Depends(get_db)):
-    s = _subject_from_path(db, subject_code)
+@router.post("/subjects/{subject_identifier}/delete", dependencies=[Depends(require_permission("schedules:delete"))])
+def admin_delete_subject(subject_identifier: str, db: Session = Depends(get_db)):
+    s = _subject_from_path(db, subject_identifier)
     db.delete(s)
     db.commit()
     return {"ok": True}
@@ -953,6 +1013,7 @@ def admin_list_subjects(db: Session = Depends(get_db), q: str | None = Query(Non
         if q:
             stmt = stmt.where(
                 or_(
+                    Subject.identifier.ilike(f"%{q}%"),
                     Subject.title.ilike(f"%{q}%"),
                     Subject.code.ilike(f"%{q}%")
                 )
@@ -980,6 +1041,7 @@ def admin_list_subjects(db: Session = Depends(get_db), q: str | None = Query(Non
         return [
             {
                 "id": row["id"],
+                "identifier": None,
                 "title": row["title"],
                 "code": row["code"],
                 "subject_code": row["code"],

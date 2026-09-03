@@ -44,6 +44,9 @@ class Subject(Base):
         CheckConstraint("grade_type IN ('exam', 'зачет')", name="ck_subjects_grade_type"),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    identifier: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, default=lambda: str(uuid4())
+    )
     code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     title: Mapped[str] = mapped_column(String(255))
     grade_type: Mapped[str | None] = mapped_column(String(10), nullable=True)
@@ -88,7 +91,8 @@ class Lesson(Base):
     __tablename__ = "lessons"
     __table_args__ = (
         CheckConstraint(
-            "subject_type IS NULL OR subject_type IN ('lecture', 'practice', 'lab')",
+            "subject_type IS NULL OR subject_type IN "
+            "('lecture', 'practice', 'educational_practice')",
             name="ck_lessons_subject_type",
         ),
     )

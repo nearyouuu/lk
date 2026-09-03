@@ -62,6 +62,10 @@ ROOM_COLUMNS = {
     "capacity": ("вместимость", "capacity"),
 }
 SUBJECT_COLUMNS = {
+    "identifier": (
+        "идентификатор дисциплины", "subject identifier", "subject_identifier",
+        "identifier", "id дисциплины",
+    ),
     "code": ("код дисциплины", "код", "subject code", "code"),
     "title": ("название дисциплины", "название", "subject title", "title"),
     "type": ("тип дисциплины", "тип", "subject type", "type"),
@@ -275,7 +279,11 @@ def _validate_columns(frames: dict[str, pd.DataFrame], present: set[str]) -> dic
         ),
         "subdivisions": (SUBDIVISION_COLUMNS, {"name"}, "Название подразделения"),
         "rooms": (ROOM_COLUMNS, {"code"}, "Код аудитории"),
-        "subjects": (SUBJECT_COLUMNS, {"title"}, "Название дисциплины"),
+        "subjects": (
+            SUBJECT_COLUMNS,
+            {"identifier", "code", "title"},
+            "Идентификатор дисциплины, Код дисциплины, Название дисциплины",
+        ),
     }
     result: dict[str, dict[str, str]] = {}
     for key, (aliases, required, required_names) in definitions.items():
@@ -451,18 +459,23 @@ def import_users_from_excel(db: Session, file_path: str, export_dir: str = "expo
 
         # 5. Дисциплины и связи с преподавателями.
         for index, row in frames["subjects"].iterrows():
+            identifier = _value(row, columns["subjects"], "identifier")
             code = _value(row, columns["subjects"], "code")
             title = _value(row, columns["subjects"], "title")
             type_name = _value(row, columns["subjects"], "type")
             primary_email = _value(row, columns["subjects"], "primary_teacher")
             teachers_raw = _value(row, columns["subjects"], "teachers")
-            report = {"Строка": index + 2, "Код": code, "Название": title, "Тип": type_name, "Основной преподаватель": primary_email, "Преподаватели": teachers_raw}
+            report = {"Строка": index + 2, "Идентификатор": identifier, "Код": code, "Название": title, "Тип": type_name, "Основной преподаватель": primary_email, "Преподаватели": teachers_raw}
             try:
+                if not identifier:
+                    raise ValueError("не указан идентификатор дисциплины")
                 if not code:
                     raise ValueError("не указан код дисциплины")
                 if not title:
                     raise ValueError("не указано название дисциплины")
-                duplicate = db.scalar(select(Subject.id).where(Subject.code == code))
+                duplicate = db.scalar(
+                    select(Subject.id).where(Subject.identifier == identifier)
+                )
                 if duplicate is not None:
                     report.update({"Статус": "Пропущена", "Комментарий": "дисциплина уже существует"})
                     reports["subjects"].append(report)
@@ -499,6 +512,7 @@ def import_users_from_excel(db: Session, file_path: str, export_dir: str = "expo
                 # The legacy catalog category is kept for import compatibility,
                 # but a discipline is no longer linked to lesson kinds.
                 subject = Subject(
+                    identifier=identifier,
                     code=code or None,
                     title=title,
                     primary_teacher_id=primary_teacher.id if primary_teacher else None,

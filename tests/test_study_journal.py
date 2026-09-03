@@ -190,7 +190,7 @@ def test_independent_journal_flow_and_period_lock():
             teacher_user,
         )
         assert len(payload["students"]) == 2
-        assert len(payload["lessons"]) == 1
+        assert [row["id"] for row in payload["days"][0]["lessons"]] == [lesson["id"]]
 
         saved = put_journal_entry(
             lesson["id"],
@@ -510,7 +510,7 @@ def test_assigned_teachers_share_the_same_journal_lessons():
             db,
             second_user,
         )
-        assert [row["id"] for row in visible["lessons"]] == [lesson["id"]]
+        assert [row["id"] for row in visible["days"][0]["lessons"]] == [lesson["id"]]
 
         saved = put_journal_entry(
             lesson["id"],
@@ -601,7 +601,8 @@ def test_journal_excel_export_contains_hours_attendance_and_grades():
                 subject_id=subject.id,
                 date=date(2026, 9, 8),
                 hours=2,
-                type="lab",
+                type="educational_practice",
+                topic_text="Учебная практика",
             ),
             None,
             None,
@@ -655,7 +656,7 @@ def test_journal_excel_export_contains_hours_attendance_and_grades():
     engine.dispose()
 
 
-def test_student_sees_only_own_read_only_journal_by_subject():
+def test_student_cannot_access_study_journal():
     engine = _engine()
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -712,47 +713,35 @@ def test_student_sees_only_own_read_only_journal_by_subject():
             )
 
         student_user = students[0].user
-        catalog = journal_catalog(2026, "autumn", None, db, student_user)
-        assert catalog["access_scope"] == "self"
-        assert [row["id"] for row in catalog["groups"]] == [group.id]
-        assert [row["id"] for row in catalog["groups"][0]["subjects"]] == [subject.id]
+        with pytest.raises(JournalAPIError) as catalog_denied:
+            journal_catalog(2026, "autumn", None, db, student_user)
+        assert catalog_denied.value.status_code == 403
 
-        group_students = journal_group_students(
-            group.id, date(2026, 9, 1), db, student_user
-        )
-        assert [row["id"] for row in group_students["items"]] == [students[0].id]
+        with pytest.raises(JournalAPIError) as students_denied:
+            journal_group_students(group.id, date(2026, 9, 1), db, student_user)
+        assert students_denied.value.status_code == 403
 
-        payload = get_journal(
-            group.id,
-            subject.id,
-            date(2026, 9, 1),
-            date(2026, 12, 31),
-            db,
-            student_user,
-        )
-        assert payload["access_scope"] == "self"
-        assert payload["permissions"] == {
-            "can_edit": False,
-            "can_manage_topics": False,
-        }
-        assert [row["id"] for row in payload["students"]] == [students[0].id]
-        assert [row["id"] for row in payload["lessons"]] == [published["id"]]
-        assert [row["student_id"] for row in payload["entries"]] == [students[0].id]
-        assert payload["entries"][0]["grade"] == "5"
+        with pytest.raises(JournalAPIError) as journal_denied:
+            get_journal(
+                group.id,
+                subject.id,
+                date(2026, 9, 1),
+                date(2026, 12, 31),
+                db,
+                student_user,
+            )
+        assert journal_denied.value.status_code == 403
 
-        export_response = export_journal_excel(
-            group.id,
-            subject.id,
-            date(2026, 9, 1),
-            date(2026, 12, 31),
-            db,
-            student_user,
-        )
-        exported_book = load_workbook(BytesIO(export_response.body), read_only=True)
-        exported_sheet = exported_book["Учебный журнал"]
-        assert exported_sheet["B7"].value == "Student 0"
-        assert exported_sheet["B8"].value is None
-        assert exported_sheet["E7"].value == "5"
+        with pytest.raises(JournalAPIError) as export_denied:
+            export_journal_excel(
+                group.id,
+                subject.id,
+                date(2026, 9, 1),
+                date(2026, 12, 31),
+                db,
+                student_user,
+            )
+        assert export_denied.value.status_code == 403
 
         with pytest.raises(JournalAPIError) as write_denied:
             put_journal_entry(
@@ -765,19 +754,6 @@ def test_student_sees_only_own_read_only_journal_by_subject():
             )
         assert write_denied.value.status_code == 403
 
-        other_group = Group(code="J-22", title="Other group")
-        db.add(other_group)
-        db.commit()
-        with pytest.raises(JournalAPIError) as other_group_denied:
-            get_journal(
-                other_group.id,
-                subject.id,
-                date(2026, 9, 1),
-                date(2026, 12, 31),
-                db,
-                student_user,
-            )
-        assert other_group_denied.value.status_code == 403
     engine.dispose()
 
 
@@ -804,9 +780,18 @@ def test_journal_lesson_types_are_required_patchable_and_audited():
                 subject_id=subject.id,
                 date=date(2026, 10, 1),
             )
+        with pytest.raises(ValidationError):
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=date(2026, 10, 1),
+                type="lecture",
+            )
 
         created = []
-        for offset, lesson_type in enumerate(("lecture", "practice", "lab"), start=1):
+        for offset, lesson_type in enumerate(
+            ("lecture", "practice", "educational_practice"), start=1
+        ):
             created.append(
                 create_journal_lesson(
                     JournalLessonCreate(
@@ -814,6 +799,7 @@ def test_journal_lesson_types_are_required_patchable_and_audited():
                         subject_id=subject.id,
                         date=date(2026, 10, offset),
                         type=lesson_type,
+                        topic_text=lesson_type,
                     ),
                     None,
                     None,
@@ -821,16 +807,22 @@ def test_journal_lesson_types_are_required_patchable_and_audited():
                     teacher_user,
                 )
             )
-        assert [lesson["type"] for lesson in created] == ["lecture", "practice", "lab"]
+        assert [lesson["type"] for lesson in created] == [
+            "lecture",
+            "practice",
+            "educational_practice",
+        ]
 
         updated = patch_journal_lesson(
             created[0]["id"],
-            JournalLessonPatch(version=created[0]["version"], type="lab"),
+            JournalLessonPatch(
+                version=created[0]["version"], type="educational_practice"
+            ),
             "lesson-type-test",
             db,
             teacher_user,
         )
-        assert updated["type"] == "lab"
+        assert updated["type"] == "educational_practice"
         assert updated["version"] == created[0]["version"] + 1
 
         audit = db.scalar(
@@ -842,10 +834,152 @@ def test_journal_lesson_types_are_required_patchable_and_audited():
             .order_by(JournalAuditEvent.id.desc())
         )
         assert audit.before["type"] == "lecture"
-        assert audit.after["type"] == "lab"
+        assert audit.after["type"] == "educational_practice"
 
         with pytest.raises(ValidationError):
             JournalLessonPatch(version=updated["version"], type=None)
+    engine.dispose()
+
+
+def test_journal_preserves_repeated_types_on_the_same_day():
+    engine = _engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        admin, teacher_user, teacher, group, subject, students = _fixture(db)
+        create_journal_assignment(
+            JournalAssignmentCreate(
+                teacher_id=teacher.id,
+                group_id=group.id,
+                subject_id=subject.id,
+                academic_year=2026,
+                semester="autumn",
+            ),
+            db,
+            admin,
+        )
+
+        lesson_date = date(2026, 9, 3)
+        lessons = {}
+        for offset, lesson_type in enumerate(
+            ("lecture", "practice", "educational_practice")
+        ):
+            lessons[lesson_type] = create_journal_lesson(
+                JournalLessonCreate(
+                    group_id=group.id,
+                    subject_id=subject.id,
+                    date=lesson_date,
+                    starts_at=time(9 + offset * 2),
+                    type=lesson_type,
+                    topic_text=lesson_type,
+                ),
+                None,
+                None,
+                db,
+                teacher_user,
+            )
+
+        repeated_practice = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=lesson_date,
+                starts_at=time(18),
+                type="practice",
+                topic_text="second practice",
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        exact_repeat = create_journal_lesson(
+            JournalLessonCreate(
+                group_id=group.id,
+                subject_id=subject.id,
+                date=lesson_date,
+                starts_at=time(18),
+                type="practice",
+                topic_text="second practice",
+            ),
+            None,
+            None,
+            db,
+            teacher_user,
+        )
+        assert exact_repeat["id"] != repeated_practice["id"]
+
+        idempotent_payload = JournalLessonCreate(
+            group_id=group.id,
+            subject_id=subject.id,
+            date=lesson_date,
+            starts_at=time(19),
+            type="practice",
+            topic_text="idempotent practice",
+        )
+        idempotent = create_journal_lesson(
+            idempotent_payload,
+            "same-create-request",
+            None,
+            db,
+            teacher_user,
+        )
+        idempotent_retry = create_journal_lesson(
+            idempotent_payload,
+            "same-create-request",
+            None,
+            db,
+            teacher_user,
+        )
+        assert idempotent_retry["id"] == idempotent["id"]
+
+        lecture_entry = put_journal_entry(
+            lessons["lecture"]["id"],
+            students[0].id,
+            JournalEntryPut(attendance="present", grade="5", version=0),
+            None,
+            db,
+            teacher_user,
+        )
+        practice_entry = put_journal_entry(
+            lessons["practice"]["id"],
+            students[0].id,
+            JournalEntryPut(attendance="late", grade="4", version=0),
+            None,
+            db,
+            teacher_user,
+        )
+
+        payload = get_journal(
+            group.id,
+            subject.id,
+            lesson_date,
+            lesson_date,
+            db,
+            teacher_user,
+        )
+        assert "lessons" not in payload
+        assert [day["date"] for day in payload["days"]] == [lesson_date.isoformat()]
+        assert [lesson["id"] for lesson in payload["days"][0]["lessons"]] == [
+            lessons["lecture"]["id"],
+            lessons["practice"]["id"],
+            lessons["educational_practice"]["id"],
+            repeated_practice["id"],
+            exact_repeat["id"],
+            idempotent["id"],
+        ]
+        assert all(
+            "date" not in lesson and lesson["type"] in {
+                "lecture",
+                "practice",
+                "educational_practice",
+            }
+            for lesson in payload["days"][0]["lessons"]
+        )
+        assert {entry["lesson_id"] for entry in payload["entries"]} == {
+            lecture_entry["lesson_id"],
+            practice_entry["lesson_id"],
+        }
+        assert {entry["grade"] for entry in payload["entries"]} == {"4", "5"}
     engine.dispose()
 
 
@@ -883,6 +1017,7 @@ def test_schedule_linked_journal_lesson_copies_schedule_type():
                 subject_id=subject.id,
                 date=date(2026, 10, 15),
                 schedule_lesson_id=scheduled.id,
+                topic_text="Занятие из расписания",
             ),
             None,
             None,

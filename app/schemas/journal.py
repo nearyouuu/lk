@@ -39,6 +39,8 @@ class JournalLessonCreate(BaseModel):
     def validate_times(self):
         if self.schedule_lesson_id is None and self.type is None:
             raise ValueError("type is required for a manual journal lesson")
+        if self.topic_id is None and self.topic_text is None:
+            raise ValueError("topic_id or topic_text is required")
         if self.starts_at and self.ends_at and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be later than starts_at")
         return self

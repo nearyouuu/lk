@@ -34,7 +34,7 @@ ATTENDANCE_FILLS = {
 LESSON_TYPE_LABELS = {
     "lecture": "Лекция",
     "practice": "Практическое занятие",
-    "lab": "Лабораторная работа",
+    "educational_practice": "Учебная практика",
 }
 
 

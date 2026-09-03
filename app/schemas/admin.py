@@ -79,6 +79,7 @@ class RoomCreateIn(BaseModel):
     capacity: int | None = None
 
 class SubjectCreateIn(BaseModel):
+    identifier: Optional[str] = None
     title: str
     subject_code: Optional[str] = None
     # Legacy alias for clients deployed before subject_code became canonical.
@@ -99,7 +100,7 @@ class SubjectCreateIn(BaseModel):
             raise ValueError("Subject title must not be empty")
         return value
 
-    @field_validator("subject_code", "code", mode="before")
+    @field_validator("identifier", "subject_code", "code", mode="before")
     @classmethod
     def normalize_subject_code(cls, value):
         if not isinstance(value, str):

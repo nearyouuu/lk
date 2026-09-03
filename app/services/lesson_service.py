@@ -44,8 +44,13 @@ def create_lesson(db: Session, payload: LessonCreate):
     if not room:
         raise HTTPException(status_code=404, detail=f"Аудитория {payload.room_code} не найдена")
 
-    if payload.subject_code or payload.subject_id:
-        subject_id = resolve_subject(db, payload.subject_code, payload.subject_id).id
+    if payload.subject_identifier or payload.subject_code or payload.subject_id:
+        subject_id = resolve_subject(
+            db,
+            payload.subject_code,
+            payload.subject_id,
+            subject_identifier=payload.subject_identifier,
+        ).id
     else:
         subject = get_or_create(db, Subject, {"title": payload.subject_title})
         subject_id = subject.id

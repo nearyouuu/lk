@@ -27,7 +27,7 @@ except ModuleNotFoundError:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -179,7 +179,7 @@ def test_delete_user_preserves_history_and_clears_optional_references():
     engine.dispose()
 
 
-def test_subject_duplicate_check_uses_only_code():
+def test_subject_identifier_allows_duplicate_code_and_title():
     engine = _engine()
     with Session(engine) as db:
         teacher = Teacher(full_name="Test Teacher")
@@ -188,8 +188,9 @@ def test_subject_duplicate_check_uses_only_code():
 
         first = admin.admin_create_subject(
             SubjectCreateIn(
+                identifier="SUBJ-A",
                 title="Одинаковое название",
-                subject_code="SUBJ-001",
+                subject_code="SAME-001",
                 teacher_ids=[teacher.id],
                 grade_type="exam",
             ),
@@ -197,8 +198,9 @@ def test_subject_duplicate_check_uses_only_code():
         )
         second = admin.admin_create_subject(
             SubjectCreateIn(
+                identifier="SUBJ-B",
                 title="Одинаковое название",
-                subject_code="SUBJ-002",
+                subject_code="SAME-001",
                 teacher_ids=[teacher.id],
                 grade_type="exam",
             ),
@@ -206,13 +208,20 @@ def test_subject_duplicate_check_uses_only_code():
         )
 
         assert first["id"] != second["id"]
-        assert db.scalar(select(Subject).where(Subject.code == "SUBJ-002")) is not None
+        assert db.scalar(select(func.count(Subject.id)).where(Subject.code == "SAME-001")) == 2
+        try:
+            admin._subject_from_path(db, "SAME-001")
+        except HTTPException as exc:
+            assert exc.status_code == 409
+        else:
+            raise AssertionError("Ambiguous legacy subject code must be rejected")
 
         try:
             admin.admin_create_subject(
                 SubjectCreateIn(
+                    identifier="SUBJ-A",
                     title="Другое название",
-                    subject_code="SUBJ-001",
+                    subject_code="OTHER-002",
                     teacher_ids=[teacher.id],
                     grade_type="exam",
                 ),
@@ -220,16 +229,17 @@ def test_subject_duplicate_check_uses_only_code():
             )
         except HTTPException as exc:
             assert exc.status_code == 400
-            assert exc.detail == "Subject already exists"
+            assert exc.detail == "Subject identifier already exists"
         else:
-            raise AssertionError("Duplicate subject code must be rejected")
+            raise AssertionError("Duplicate subject identifier must be rejected")
 
         try:
             admin.admin_update_subject(
-                "SUBJ-002",
+                "SUBJ-B",
                 SubjectCreateIn(
+                    identifier="SUBJ-A",
                     title="Одинаковое название",
-                    subject_code="SUBJ-001",
+                    subject_code="SAME-001",
                     teacher_ids=[teacher.id],
                     grade_type="exam",
                 ),
@@ -237,9 +247,9 @@ def test_subject_duplicate_check_uses_only_code():
             )
         except HTTPException as exc:
             assert exc.status_code == 400
-            assert exc.detail == "Subject already exists"
+            assert exc.detail == "Subject identifier already exists"
         else:
-            raise AssertionError("Updating to a duplicate subject code must be rejected")
+            raise AssertionError("Updating to a duplicate subject identifier must be rejected")
     engine.dispose()
 
 
@@ -252,10 +262,14 @@ def test_public_subject_contract_uses_subject_code():
     components = schema["components"]["schemas"]
 
     for component_name, field_name in (
+        ("SubjectCreateIn", "identifier"),
         ("SubjectCreateIn", "subject_code"),
         ("SubjectCreateIn", "teacher_ids"),
+        ("LessonCreate", "subject_identifier"),
         ("LessonCreate", "subject_code"),
+        ("LessonUpdate", "subject_identifier"),
         ("LessonUpdate", "subject_code"),
+        ("LessonOut", "subject_identifier"),
         ("LessonOut", "subject_code"),
         ("FinalGradeIn", "subject_code"),
         ("GradeUpdate", "subject_code"),
@@ -267,8 +281,8 @@ def test_public_subject_contract_uses_subject_code():
     ):
         assert field_name in components[component_name]["properties"]
 
-    assert "/admin/subjects/{subject_code}/patch" in schema["paths"]
-    assert "/admin/subjects/{subject_code}/delete" in schema["paths"]
+    assert "/admin/subjects/{subject_identifier}/patch" in schema["paths"]
+    assert "/admin/subjects/{subject_identifier}/delete" in schema["paths"]
     assert "/grades/final/{student_id}/{subject_code}" in schema["paths"]
 
     material_body = schema["paths"]["/materials/"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]

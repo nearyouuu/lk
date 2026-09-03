@@ -21,6 +21,7 @@ def lesson_to_out(lesson: Lesson) -> LessonOut:
         group=lesson.group.code if lesson.group else None,
         subject=lesson.subject.title if lesson.subject else None,
         subject_code=lesson.subject.code if lesson.subject else None,
+        subject_identifier=lesson.subject.identifier if lesson.subject else None,
         teacher=lesson.teacher.full_name if lesson.teacher else None,
         room=lesson.room.code if lesson.room else None,
         starts_at=lesson.starts_at,

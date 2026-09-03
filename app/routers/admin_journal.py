@@ -22,6 +22,8 @@ from app.schemas.journal import (
 )
 from app.services.journal_service import (
     error,
+    get_student,
+    get_teacher,
     get_or_create_period,
     has_permission,
     is_privileged,
@@ -63,6 +65,12 @@ def list_subject_topics(
     db: Session = Depends(get_db),
     me: User = Depends(get_current_user),
 ):
+    if (
+        not is_privileged(db, me)
+        and get_teacher(db, me, required=False) is None
+        and get_student(db, me, required=False) is not None
+    ):
+        error(403, "JOURNAL_ACCESS_DENIED", "Студентам учебный журнал недоступен")
     if not (
         has_permission(db, me, "journal.read")
         or has_permission(db, me, "journal.topic.manage")

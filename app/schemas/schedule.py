@@ -17,6 +17,7 @@ class LessonCreate(BaseModel):
     notes: Optional[str] = None
 
     subject_code: Optional[str] = None
+    subject_identifier: Optional[str] = None
     subject_id: Optional[int] = None
     teacher_id: Optional[int] = None
 
@@ -28,7 +29,7 @@ class LessonCreate(BaseModel):
 
     lesson_number: Optional[int] = None
 
-    @field_validator("subject_code", "subject_title", mode="before")
+    @field_validator("subject_identifier", "subject_code", "subject_title", mode="before")
     @classmethod
     def normalize_str(cls, v):
         if isinstance(v, str) and not v.strip():
@@ -44,8 +45,8 @@ class LessonCreate(BaseModel):
 
     @model_validator(mode="after")
     def _check_subject(self):
-        if not self.subject_code and self.subject_id is None and not self.subject_title:
-            raise ValueError("subject_code is required")
+        if not self.subject_identifier and not self.subject_code and self.subject_id is None and not self.subject_title:
+            raise ValueError("subject_id or subject_identifier is required")
         return self
 
 
@@ -56,6 +57,7 @@ class LessonTimeCreate(BaseModel):
 
 class LessonUpdate(BaseModel):
     group_code: Optional[str] = None
+    subject_identifier: Optional[str] = None
     subject_code: Optional[str] = None
     subject_id: Optional[int] = None
     subject_title: Optional[str] = None
@@ -78,6 +80,7 @@ class LessonOut(BaseModel):
     group: str
     subject: str
     subject_code: str | None = None
+    subject_identifier: str | None = None
     teacher: Optional[str] = None
     room: Optional[str] = None
     starts_at: datetime

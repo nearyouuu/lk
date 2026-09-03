@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, select
 from sqlalchemy.orm import Session
 
 from app.models.grade import Student
@@ -188,29 +188,6 @@ def ensure_pair_access(
     return teacher
 
 
-def student_has_journal_access(
-    db: Session,
-    student: Student,
-    group_id: int,
-    subject_id: int,
-    academic_year: int,
-    semester: str,
-) -> bool:
-    if student.group_id != group_id:
-        return False
-    return bool(
-        db.scalar(
-            select(JournalAssignment.id).where(
-                JournalAssignment.group_id == group_id,
-                JournalAssignment.subject_id == subject_id,
-                JournalAssignment.academic_year == academic_year,
-                JournalAssignment.semester == semester,
-                JournalAssignment.is_active.is_(True),
-            ).limit(1)
-        )
-    )
-
-
 def ensure_journal_read_access(
     db: Session,
     user: User,
@@ -219,19 +196,11 @@ def ensure_journal_read_access(
     academic_year: int,
     semester: str,
 ) -> Student | None:
-    """Return the student profile for self-scoped reads, otherwise validate staff access."""
+    """Validate journal read access for staff users."""
     if not is_privileged(db, user) and get_teacher(db, user, required=False) is None:
         student = get_student(db, user, required=False)
         if student is not None:
-            if not student_has_journal_access(
-                db, student, group_id, subject_id, academic_year, semester
-            ):
-                error(
-                    403,
-                    "JOURNAL_ACCESS_DENIED",
-                    "Дисциплина недоступна студенту текущей группы",
-                )
-            return student
+            error(403, "JOURNAL_ACCESS_DENIED", "Студентам учебный журнал недоступен")
     ensure_pair_access(db, user, group_id, subject_id, academic_year, semester)
     return None
 

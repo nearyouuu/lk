@@ -70,6 +70,7 @@ def student_study_overview(
     for s in subjects:
         subj_dict[s.id] = {
             "id": s.id,
+            "identifier": s.identifier,
             "title": s.title,
             "code": s.code,
             "subject_code": s.code,
@@ -165,6 +166,7 @@ def all_students_study_overview(
         for s in subjects:
             subj_dict[s.id] = {
                 "id": s.id,
+                "identifier": s.identifier,
                 "title": s.title,
                 "code": s.code,
                 "subject_code": s.code,

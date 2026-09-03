@@ -164,7 +164,7 @@ class UserImporterTests(unittest.TestCase):
                 {"Код аудитории": "BAD", "Название аудитории": "Ошибка", "Вместимость": 0},
             ],
             "Дисциплины": [
-                {"Код дисциплины": "CS101", "Название дисциплины": "Основы программирования", "Тип дисциплины": "обязательная", "Email основного преподавателя": "it.teacher@test.kz", "Email преподавателей": "it.teacher@test.kz"},
+                {"Идентификатор дисциплины": "SUBJ-CS101", "Код дисциплины": "CS101", "Название дисциплины": "Основы программирования", "Тип дисциплины": "обязательная", "Email основного преподавателя": "it.teacher@test.kz", "Email преподавателей": "it.teacher@test.kz"},
             ],
         })
 
@@ -199,20 +199,22 @@ class UserImporterTests(unittest.TestCase):
         self.assertEqual(result.created, 0)
         self.assertEqual(self.db.scalar(select(func.count(Room.id))), 1)
 
-    def test_subject_import_duplicate_check_uses_only_code(self):
-        self.db.add(Subject(code="OLD-101", title="Общее название", grade_type="exam"))
+    def test_subject_import_uses_identifier_and_allows_duplicate_code_and_title(self):
+        self.db.add(Subject(identifier="SUBJ-OLD", code="SAME-101", title="Общее название", grade_type="exam"))
         self.db.commit()
         path = self._sheets_workbook({
             "Дисциплины": [
-                {"Код дисциплины": "NEW-202", "Название дисциплины": "Общее название"},
-                {"Код дисциплины": "OLD-101", "Название дисциплины": "Другое название"},
+                {"Идентификатор дисциплины": "SUBJ-NEW", "Код дисциплины": "SAME-101", "Название дисциплины": "Общее название"},
+                {"Идентификатор дисциплины": "SUBJ-OLD", "Код дисциплины": "OTHER-202", "Название дисциплины": "Другое название"},
             ]
         })
 
         result = import_users_from_excel(self.db, path, self.temp_dir.name)
 
         self.assertEqual(result.subjects_created, 1)
-        self.assertIsNotNone(self.db.scalar(select(Subject).where(Subject.code == "NEW-202")))
+        created = self.db.scalar(select(Subject).where(Subject.identifier == "SUBJ-NEW"))
+        self.assertIsNotNone(created)
+        self.assertEqual((created.code, created.title), ("SAME-101", "Общее название"))
         self.assertEqual(self.db.scalar(select(func.count(Subject.id))), 2)
 
     def test_distributed_template_is_a_valid_xlsx(self):
@@ -223,6 +225,8 @@ class UserImporterTests(unittest.TestCase):
             workbook.sheet_names,
             ["Пользователи", "Группы", "Подразделения", "Аудитории", "Дисциплины", "Инструкция"],
         )
+        subject_columns = pd.read_excel(template, sheet_name="Дисциплины", nrows=0).columns.tolist()
+        self.assertEqual(subject_columns[0], "Идентификатор дисциплины")
 
     def test_semester_payload_is_normalized_and_stored_in_schema(self):
         payload = FinalGradeIn(
